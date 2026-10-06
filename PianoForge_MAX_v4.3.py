@@ -330,6 +330,18 @@ def eta_seconds(perf: dict[str, Any], key: str, audio_s: Optional[float], stage:
     return max(0.0, cur_total - stage_elapsed_s) + sum(est[n] for n in names[1:])
 
 
+def _cuda_batch_size(default: int = 16) -> int:
+    """Transcription batch (10 s segments) scaled to the free GPU memory: more throughput on A100/L4-class
+    cards, no out-of-memory on small ones. Falls back to the old fixed 16 when the query fails."""
+    try:
+        import torch
+
+        free_gb = torch.cuda.mem_get_info()[0] / 2**30
+    except Exception:
+        return default
+    return 32 if free_gb >= 20 else 16 if free_gb >= 8 else 8 if free_gb >= 4 else 4
+
+
 def runtime_fingerprint() -> str:
     """Short id of everything that changes what a cached transcription backend would produce."""
     parts = [VERSION, SOURCES_BUNDLE_SHA256]
@@ -732,7 +744,15 @@ class App:
                         "transcription.max_polyphony": 16})
         # v4.2 MAX-FIDELITY: independent multi-source evidence is enabled, but other stems are NOT converted into piano notes by default.
         # The default ensemble is ByteDance normal/TTA + optional Transkun on the same source.
-        upd.update({"transcription.extra_sources": ["vocals", "bass", "other"],
+        # The MAX evidence block must not undo the lighter "fast" settings chosen above (it used to:
+        # fast still transcribed vocals+bass+other and filled gaps, so it was barely faster than max).
+        fast = options.get("quality", "max") == "fast"
+        if fast:
+            upd.update({"transcription.octave_relocate": True, "transcription.noise_filter": True,
+                        "transcription.music_cleanup": True,  # note-filter strictness stays with the chosen notes mode
+                        "postprocess.snap.strength": 0.34, "postprocess.snap.max_shift_s": 0.024})
+        else:
+          upd.update({"transcription.extra_sources": ["vocals", "bass", "other"],
                     "transcription.second_model_sources": ["piano_source", "vocals", "other"],
                     "transcription.gap_fill_mode": "uncovered", "transcription.gap_fill_min_gap_s": 0.30,
                     "transcription.gap_fill_min_voiced_prob": 0.68, "transcription.gap_fill_floor_db": -45.0,
@@ -741,7 +761,7 @@ class App:
                     "transcription.octave_relocate": True, "transcription.noise_filter": True,
                     "postprocess.snap.strength": 0.34, "postprocess.snap.max_shift_s": 0.024})
         if self.device == "cuda" and options.get("device", "auto") in ("auto", "cuda"):
-            upd["transcription.batch_size"] = 16  # 10 s segments: a T4 handles 16 at once easily
+            upd["transcription.batch_size"] = _cuda_batch_size()
         upd["render.soundfont_path"] = best_soundfont(options.get("piano", "auto"))[0]
         upd["runtime.device"] = options.get("device", "auto")
         upd["postprocess.pedal.mode"] = "cc" if options.get("pedal", True) else "drop"
