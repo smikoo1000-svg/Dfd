@@ -200,6 +200,7 @@ OUTPUT_FILES = {
     "piano_preview.mp3": "audio/mpeg", "piano_fixed_preview.mp3": "audio/mpeg",
     "piano_arranged_preview.mp3": "audio/mpeg", "original_preview.mp3": "audio/mpeg",
     "piano.musicxml": "application/vnd.recordare.musicxml+xml", "prompt.txt": "text/plain; charset=utf-8",
+    "keywords_report.md": "text/markdown; charset=utf-8", "keywords_report.json": "application/json",
 }
 REFINE_OUTPUTS = ("piano_fixed.mid", "piano_fixed.wav", "piano_arranged.mid", "piano_arranged.wav",
                   "refine_report.md", "refine_report.json", "piano_fixed_preview.mp3", "piano_arranged_preview.mp3")
@@ -601,6 +602,1215 @@ def write_project() -> None:
 # =========================================================================== jobs
 
 
+# =========================================================================== keyword analysis (v4.3)
+# Symbolic detectors for the music-theory / technique keywords. Input is the finished piano.mid
+# (notes + sustain pedal) and optionally the music analysis from report.json; output is an evidence
+# report. Every item is "detected" (with a count / evidence), "not_found" (searched, absent) or
+# "not_recoverable" (cannot be known from audio -> MIDI; the reason is given). Nothing is faked.
+import math as _math
+
+_PC = ("C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B")
+_KS_MAJOR = (6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88)
+_KS_MINOR = (6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17)
+_SCALES: dict[str, tuple[int, ...]] = {
+    "장음계(이오니아)": (0, 2, 4, 5, 7, 9, 11), "단음계(자연)": (0, 2, 3, 5, 7, 8, 10),
+    "화성단음계": (0, 2, 3, 5, 7, 8, 11), "도리안": (0, 2, 3, 5, 7, 9, 10), "프리지안": (0, 1, 3, 5, 7, 8, 10),
+    "리디안": (0, 2, 4, 6, 7, 9, 11), "믹솔리디안": (0, 2, 4, 5, 7, 9, 10), "로크리안": (0, 1, 3, 5, 6, 8, 10),
+    "장 펜타토닉": (0, 2, 4, 7, 9), "단 펜타토닉": (0, 3, 5, 7, 10), "블루스 스케일": (0, 3, 5, 6, 7, 10),
+    "온음음계": (0, 2, 4, 6, 8, 10)}
+_CHORDS: dict[str, tuple[int, ...]] = {
+    "maj": (0, 4, 7), "min": (0, 3, 7), "dim": (0, 3, 6), "aug": (0, 4, 8), "sus4": (0, 5, 7), "sus2": (0, 2, 7),
+    "7": (0, 4, 7, 10), "maj7": (0, 4, 7, 11), "min7": (0, 3, 7, 10), "m7b5": (0, 3, 6, 10), "dim7": (0, 3, 6, 9),
+    "mM7": (0, 3, 7, 11)}
+_DYN = (("pp", 0, 36), ("p", 36, 50), ("mp", 50, 64), ("mf", 64, 80), ("f", 80, 96), ("ff", 96, 128))
+
+
+def _med(xs):
+    s = sorted(xs)
+    return 0.0 if not s else s[len(s) // 2] if len(s) % 2 else (s[len(s) // 2 - 1] + s[len(s) // 2]) / 2
+
+
+def _corr(a, b):
+    ma, mb = sum(a) / len(a), sum(b) / len(b)
+    num = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+    den = _math.sqrt(sum((x - ma) ** 2 for x in a) * sum((y - mb) ** 2 for y in b))
+    return num / den if den else 0.0
+
+
+def _hist(notes):
+    h = [0.0] * 12
+    for n in notes:
+        h[n.pitch % 12] += round(max(0.05, n.offset_s - n.onset_s), 3)
+    return h
+
+
+def estimate_key(notes):
+    """(tonic_pc, 'major'|'minor', correlation) by Krumhansl-Schmuckler on duration-weighted pitch classes."""
+    h = _hist(notes)
+    if not any(h):
+        return 0, "major", 0.0
+    if max(h) - min(h) < 0.02 * sum(h) / 12:  # all twelve pitch classes equally used: no key at all
+        return 0, "major", 0.0
+    tot = sum(h)
+    major_iv, minor_iv = (0, 2, 4, 5, 7, 9, 11), (0, 2, 3, 5, 7, 8, 10)
+    cands = []
+    for tonic in range(12):
+        rot = [h[(tonic + i) % 12] for i in range(12)]
+        for mode, prof, iv in (("major", _KS_MAJOR, major_iv), ("minor", _KS_MINOR, minor_iv)):
+            cands.append((_corr(rot, prof), tonic, mode, sum(rot[i] for i in iv) / tot))
+    fit = [c for c in cands if c[3] >= 0.97]  # when the notes fit one diatonic set, only those keys compete
+    r, tonic, mode, _ = max(fit or cands)
+    return tonic, mode, r
+
+
+def _clusters(notes, win=0.045):
+    """Notes whose onsets lie within `win` seconds: chords / simultaneities (list of lists, sorted by pitch)."""
+    out, cur = [], []
+    for n in sorted(notes, key=lambda x: x.onset_s):
+        if cur and n.onset_s - cur[0].onset_s > win:
+            out.append(sorted(cur, key=lambda x: x.pitch))
+            cur = []
+        cur.append(n)
+    if cur:
+        out.append(sorted(cur, key=lambda x: x.pitch))
+    return out
+
+
+def estimate_beat(notes):
+    """Quarter-note length in seconds from the inter-onset histogram (0.5 s when it cannot be told)."""
+    ons = sorted({round(c[0].onset_s, 3) for c in _clusters(notes)})
+    iois = [b - a for a, b in zip(ons, ons[1:]) if 0.08 <= b - a <= 2.0]
+    if len(iois) < 8:
+        return 0.5
+    best_b, best_s = 0.5, -1.0
+    for bpm in range(40, 221):
+        b = 60.0 / bpm
+        s = 0.0
+        for d in iois:
+            for mult in (0.25, 0.5, 1.0, 2.0):
+                x = d / (b * mult)
+                s += max(0.0, 1 - abs(x - round(x)) / 0.12) if round(x) >= 1 else 0.0
+        s += 0.0 + (0.5 if 70 <= bpm <= 140 else 0.0)
+        if s > best_s:
+            best_b, best_s = b, s
+    return best_b
+
+
+def tempo_term_ko(bpm):
+    for edge, name in ((50, "라르고(Largo)"), (66, "아다지오(Adagio)"), (92, "안단테(Andante)"), (112, "모데라토(Moderato)"),
+                       (144, "알레그로(Allegro)"), (1e9, "프레스토(Presto)")):
+        if bpm < edge:
+            return name
+
+
+class _R(dict):
+    """One keyword result: {found, count, detail}."""
+
+
+def _res(count, detail="", **kw):
+    return {"found": bool(count), "count": int(count) if not isinstance(count, float) else round(count, 3), "detail": detail, **kw}
+
+
+# ----------------------------------------------------------------------------------------- detectors
+def d_pitch(notes):
+    ps = [n.pitch for n in notes]
+    inside = sum(1 for p in ps if 21 <= p <= 108)
+    return {"88건반": _res(inside == len(ps) and bool(ps), f"{min(ps)}~{max(ps)} (MIDI 21~108 안: {inside}/{len(ps)})") if ps else _res(0),
+            "음높이(Pitch)": _res(len(ps), f"음 {len(ps)}개, 최저 {min(ps) if ps else '-'} 최고 {max(ps) if ps else '-'}"),
+            "음의 길이(Duration)": _res(len(ps), f"중앙값 {_med([n.offset_s - n.onset_s for n in notes]):.3f}s")}
+
+
+def d_intervals(notes):
+    line = [c[-1].pitch for c in _clusters(notes) if c[-1].pitch >= 55]
+    steps = [abs(b - a) for a, b in zip(line, line[1:])]
+    semi, whole = sum(1 for s in steps if s == 1), sum(1 for s in steps if s == 2)
+    leaps = sum(1 for s in steps if s >= 10)
+    hist: dict[int, int] = {}
+    for s in steps:
+        hist[min(s, 24)] = hist.get(min(s, 24), 0) + 1
+    return {"반음": _res(semi, "멜로디 반음 진행"), "온음": _res(whole, "멜로디 온음 진행"),
+            "대도약": _res(leaps, "멜로디 도약 ≥ 7도(10반음)"), "음정(Interval)": _res(len(steps), "멜로디 음정 분포(반음수:횟수)", histogram=dict(sorted(hist.items())))}
+
+
+def d_scale(notes, key):
+    tonic, mode, r = key
+    h = _hist(notes)
+    tot = sum(h) or 1.0
+    fits = []
+    for name, iv in _SCALES.items():
+        for t in range(12):
+            cov = sum(h[(t + i) % 12] for i in iv) / tot
+            if cov >= 0.96:
+                fits.append((len(iv), -cov, t, name))
+    fits.sort()
+    used = sum(1 for x in h if x / tot > 0.01)
+    out = {"음계(Scale)": _res(1 if notes else 0, f"추정 조성 {_PC[tonic]} {mode} (상관 {r:.2f})")}
+    for kw, names in (("장음계", ("장음계(이오니아)",)), ("단음계", ("단음계(자연)", "화성단음계")),
+                      ("펜타토닉", ("장 펜타토닉", "단 펜타토닉")), ("블루스 스케일", ("블루스 스케일",))):
+        hit = [f for f in fits if f[3] in names and f[2] == tonic or (kw in ("펜타토닉", "블루스 스케일") and f[3] in names and used <= 6)]
+        hit = [f for f in hit if f[3] in names]
+        if kw in ("장음계", "단음계"):
+            hit = [f for f in hit if (mode == "major") == (kw == "장음계")]
+        out[kw] = _res(len(hit), f"{_PC[hit[0][2]]} {hit[0][3]} 적합 {-hit[0][1]:.0%}" if hit else "")
+    modes = [f for f in fits if f[3] in ("도리안", "프리지안", "리디안", "믹솔리디안", "로크리안") and f[2] == tonic and used <= 7]
+    mode_names = sorted({f[3] for f in modes})
+    out["선법(모드)"] = _res(len(mode_names), ", ".join(mode_names) + " (조성 으뜸음 기준, 상대조 모호성 있음)" if mode_names else "")
+    bn = {3: "b3", 6: "b5", 10: "b7"}
+    blue = [bn[i] for i in bn if h[(tonic + i) % 12] / tot > 0.02 and h[(tonic + i + (1 if i == 3 else 0)) % 12] > 0 and mode == "major"] if mode == "major" else []
+    out["블루노트"] = _res(len(blue), "장조 안의 " + "/".join(blue) if blue else "")
+    chrom = sum(h[(tonic + i) % 12] for i in range(12) if i not in (0, 2, 4, 5, 7, 9, 11 if mode == "major" else 10, 3 if mode == "minor" else 4)) / tot
+    out["__chromatic_share"] = chrom
+    return out
+
+
+def chord_track(notes, beat_s, tonic):
+    """Chord label per half-bar (2 beats) window: list of dicts {t, root, kind, tens, bass, degree}."""
+    if not notes:
+        return []
+    win = beat_s * 2.0
+    end = max(n.offset_s for n in notes)
+    out = []
+    t = min(n.onset_s for n in notes)
+    while t < end:
+        w = [n for n in notes if n.onset_s < t + win and n.offset_s > t + 0.05]
+        t0 = t
+        t += win
+        if len(w) < 2:
+            continue
+        pcw = [0.0] * 12
+        for n in w:
+            pcw[n.pitch % 12] += min(n.offset_s, t0 + win) - max(n.onset_s, t0) + 0.02
+        tot = sum(pcw)
+        bass = min(w, key=lambda x: x.pitch).pitch % 12
+        best = None
+        for root in range(12):
+            for kind, iv in _CHORDS.items():
+                inn = sum(pcw[(root + i) % 12] for i in iv) / tot
+                out_w = 1.0 - inn
+                sc = inn - 0.9 * out_w - 0.02 * len(iv) + (0.04 if root == bass else 0.0) - (0.03 if kind in ("aug", "sus2", "sus4", "dim7", "mM7") else 0)
+                if best is None or sc > best[0]:
+                    best = (sc, root, kind, inn)
+        if best and best[3] >= 0.78:
+            _, root, kind, _ = best
+            base_iv = _CHORDS[kind]
+            tens = [name for name, i in (("9", 2), ("11", 5), ("13", 9)) if i not in base_iv and pcw[(root + i) % 12] / tot > 0.08
+                    and kind in ("7", "maj7", "min7", "m7b5", "maj", "min") and (len(base_iv) == 4 or name == "9") and not (name == "11" and 4 in base_iv)]
+            out.append({"t": round(t0, 3), "root": root, "kind": kind, "tens": tens, "bass": bass, "degree": (root - tonic) % 12})
+    comp = []
+    for c in out:
+        if not comp or (comp[-1]["root"], comp[-1]["kind"]) != (c["root"], c["kind"]):
+            comp.append(c)
+        elif c["tens"] and not comp[-1]["tens"]:
+            comp[-1]["tens"] = c["tens"]
+    return comp
+
+
+def d_chords(chords, key, notes, phrase_ends):
+    tonic, mode, _ = key
+    kinds = [c["kind"] for c in chords]
+    res = {"화음(코드)": _res(len(chords), "코드 구간 " + " ".join(f"{_PC[c['root']]}{c['kind']}" for c in chords[:16]) + (" …" if len(chords) > 16 else ""))}
+    res["텐션 코드(9th·11th·13th)"] = _res(sum(1 for c in chords if c["tens"]), "; ".join(f"{_PC[c['root']]}{c['kind']}({','.join(c['tens'])})" for c in chords if c["tens"])[:200])
+    res["증화음(어그먼트)"] = _res(kinds.count("aug"), "")
+    res["감화음(디미니쉬)"] = _res(kinds.count("dim") + kinds.count("dim7"), "dim/dim7")
+    fn: dict[str, int] = {"T": 0, "S": 0, "D": 0}
+    for c in chords:
+        d = c["degree"]
+        fn["T" if d in (0, 9, 4, 3, 8) else "S" if d in (5, 2, 1) else "D" if d in (7, 11, 10) else "T"] += 1
+    res["기능화성"] = _res(len(chords), f"토닉 {fn['T']} / 서브도미넌트 {fn['S']} / 도미넌트 {fn['D']}")
+    for kw, degs in (("으뜸화음(토닉)", (0,)), ("버금딸림화음(서브도미넌트)", (5, 2)), ("딸림화음(도미넌트)", (7,))):
+        res[kw] = _res(sum(1 for c in chords if c["degree"] in degs and c["kind"] in ("maj", "min", "7", "min7", "maj7")), "")
+    pairs = list(zip(chords, chords[1:]))
+    auth = sum(1 for a, b in pairs if a["degree"] == 7 and b["degree"] == 0 and a["kind"] in ("maj", "7") and b["kind"] in ("maj", "min", "maj7", "min7"))
+    auth_root = sum(1 for a, b in pairs if a["degree"] == 7 and b["degree"] == 0 and a["bass"] == a["root"] and b["bass"] == b["root"])
+    plagal = sum(1 for a, b in pairs if a["degree"] == 5 and b["degree"] == 0)
+    deceptive = sum(1 for a, b in pairs if a["degree"] == 7 and b["degree"] in (9, 8))
+    half = sum(1 for i in phrase_ends if 0 <= i < len(chords) and chords[i]["degree"] == 7)
+    res["종지법"] = _res(auth + plagal + deceptive + half, f"정격 {auth} · 변격 {plagal} · 위종지 {deceptive} · 반종지 {half}")
+    res["정격종지"] = _res(auth, f"V→I {auth}회 (둘 다 근음위치: {auth_root}회)")
+    res["반종지"] = _res(half, "악구가 V에서 끝남")
+    res["위종지"] = _res(deceptive, "V→vi/♭VI")
+    iivi = sum(1 for a, b, c in zip(chords, chords[1:], chords[2:])
+               if (b["root"] - a["root"]) % 12 == 5 and (c["root"] - b["root"]) % 12 == 5 and a["kind"] in ("min", "min7", "m7b5") and b["kind"] in ("7", "maj") and c["kind"] in ("maj", "maj7", "min", "min7"))
+    res["투파이브원(II-V-I)"] = _res(iivi, "")
+    secd = sum(1 for a, b in pairs if a["kind"] in ("7", "maj") and (a["root"] - b["root"]) % 12 == 7 and a["degree"] != 7 and b["degree"] != 0 and b["kind"] in ("maj", "min", "min7", "maj7") and a["degree"] not in (0, 5, 2, 9) or
+               (a["kind"] == "7" and (a["root"] - b["root"]) % 12 == 7 and a["degree"] != 7 and b["degree"] != 0))
+    res["세컨더리 도미넌트"] = _res(secd, "V7/x: 으뜸이 아닌 화음으로 해결되는 도미넌트 7th")
+    tri = sum(1 for a, b in pairs if a["kind"] == "7" and (a["root"] - b["root"]) % 12 == 1 and a["degree"] != 1)
+    res["대리화음(트라이톤 서브스티튜션)"] = _res(tri, "7th 화음이 반음 아래로 해결(♭II7→I)")
+    borrowed = 0
+    if mode == "major":
+        borrowed = sum(1 for c in chords if (c["degree"] in (8, 10, 3) and c["kind"] in ("maj", "7", "maj7")) or (c["degree"] == 5 and c["kind"] in ("min", "min7")))
+    res["모달 인터체인지"] = _res(borrowed, "동명단조 차용(♭VI·♭VII·♭III·iv)" if mode == "major" else "장조 조성에서만 판정")
+    unresolved = 0
+    resolved = 0
+    for a, b in pairs:
+        if a["kind"] in ("7", "dim", "dim7", "m7b5"):
+            ok = (a["root"] - b["root"]) % 12 in (7, 1) or (b["root"] - a["root"]) % 12 in (1, 3)
+            resolved += 1 if ok and b["kind"] in ("maj", "min", "maj7", "min7") else 0
+            unresolved += 0 if ok else 1
+    res["화성 해결"] = _res(resolved, f"불안정 화음 {resolved + unresolved}개 중 해결 {resolved}")
+    return res
+
+
+def d_dissonance(notes):
+    cons = dis = 0
+    for c in _clusters(notes, 0.04):
+        ps = sorted({n.pitch for n in c})
+        for i in range(len(ps)):
+            for j in range(i + 1, len(ps)):
+                ic = (ps[j] - ps[i]) % 12
+                if ic in (1, 2, 6, 10, 11):
+                    dis += 1
+                else:
+                    cons += 1
+    tot = cons + dis
+    cluster = 0
+    for c in _clusters(notes, 0.05):
+        ps = sorted({n.pitch for n in c})
+        run = 1
+        for a, b in zip(ps, ps[1:]):
+            run = run + 1 if b - a <= 2 else 1
+            if run >= 3:
+                cluster += 1
+                break
+    return {"협화음": _res(cons, f"동시 음정 {tot}쌍 중 {cons / tot:.0%}" if tot else ""), "불협화음": _res(dis, f"{dis / tot:.0%}" if tot else ""),
+            "클러스터 화음": _res(cluster, "온음·반음으로 붙은 3음 이상 동시 발음")}
+
+
+def d_tonality(notes, key):
+    h = _hist(notes)
+    tot = sum(h) or 1.0
+    used = sum(1 for x in h if x / tot > 0.02)
+    seq = [c[-1].pitch % 12 for c in _clusters(notes)]
+    rows = 0
+    i = 0
+    while i + 12 <= len(seq):
+        if len(set(seq[i:i + 12])) == 12:
+            rows += 1
+            i += 12
+        else:
+            i += 1
+    atonal = key[2] < 0.5 and used >= 10
+    lo = [n for n in notes if n.pitch < 60]
+    hi = [n for n in notes if n.pitch >= 60]
+    bit, detail = 0, ""
+    if len(lo) > 20 and len(hi) > 20:
+        kl, kh = estimate_key(lo), estimate_key(hi)
+        rel = (kl[0] - kh[0]) % 12
+        if kl[2] > 0.75 and kh[2] > 0.75 and rel not in (0, 3, 9):
+            hl, hh = _hist(lo), _hist(hi)
+            ov = sum(min(a / (sum(hl) or 1), b / (sum(hh) or 1)) for a, b in zip(hl, hh))
+            if ov < 0.75:
+                bit, detail = 1, f"왼손권 {_PC[kl[0]]} {kl[1]} · 오른손권 {_PC[kh[0]]} {kh[1]}"
+    return {"12음기법": _res(rows if rows >= 2 and atonal else 0, f"12음 열 {rows}개" if rows else "", ), "무조성(Atonality)": _res(1 if atonal else 0, f"조성 상관 {key[2]:.2f}, 사용 음이름 {used}/12"),
+            "복조성(Bitonality/Polytonality)": _res(bit, detail)}
+
+
+def d_modulation(notes, key):
+    if len(notes) < 40:
+        return {"전조(조바꿈)": _res(0)}
+    end = max(n.offset_s for n in notes)
+    seg = max(6.0, end / 8)
+    keys, t = [], 0.0
+    while t < end:
+        w = [n for n in notes if t <= n.onset_s < t + seg]
+        if len(w) >= 12:
+            k = estimate_key(w)
+            if k[2] >= 0.6:
+                keys.append((round(t, 1), k[0], k[1]))
+        t += seg
+    changes = []
+    for a, b in zip(keys, keys[1:]):
+        if (a[1], a[2]) != (b[1], b[2]):
+            changes.append(f"{b[0]}s {_PC[a[1]]}{a[2][:3]}→{_PC[b[1]]}{b[2][:3]}")
+    # a change must persist for two segments to count (single-segment wobble is a borrowed chord, not a modulation)
+    real = [c for i, c in enumerate(changes)]
+    stable = 0
+    for i in range(len(keys) - 2):
+        if (keys[i][1], keys[i][2]) != (keys[i + 1][1], keys[i + 1][2]) and (keys[i + 1][1], keys[i + 1][2]) == (keys[i + 2][1], keys[i + 2][2]):
+            stable += 1
+    return {"전조(조바꿈)": _res(stable, "; ".join(real[:6]))}
+
+
+def _bar_hist(notes, bars):
+    out = []
+    for a, b in zip(bars, bars[1:]):
+        v = [0.0] * 12
+        for n in notes:
+            if a <= n.onset_s < b:
+                v[n.pitch % 12] += 1
+        out.append(v)
+    return out
+
+
+def _cos(a, b):
+    na, nb = _math.sqrt(sum(x * x for x in a)), _math.sqrt(sum(x * x for x in b))
+    return sum(x * y for x, y in zip(a, b)) / (na * nb) if na and nb else 0.0
+
+
+def d_form(notes, bars, key):
+    res = {}
+    if len(bars) < 9:
+        for k in ("2부 형식", "3부 형식", "소나타 형식", "론도 형식", "변주곡", "제시부", "전개부(발전부)", "재현부"):
+            res[k] = _res(0, "곡이 짧아 형식 판정 불가")
+        return res
+    vecs = _bar_hist(notes, bars)
+    per = 4
+    secs = []
+    for i in range(0, len(vecs) - per + 1, per):
+        v = [sum(vecs[i + j][p] for j in range(per)) for p in range(12)]
+        secs.append(v)
+    labels: list[str] = []
+    protos: list[list[float]] = []
+    for v in secs:
+        for li, p in enumerate(protos):
+            if _cos(v, p) >= 0.9:
+                labels.append(chr(65 + li))
+                break
+        else:
+            protos.append(v)
+            labels.append(chr(65 + len(protos) - 1))
+    comp = [labels[0]]
+    for l in labels[1:]:
+        if l != comp[-1]:
+            comp.append(l)
+    form = "".join(comp)
+    n_unique = len(set(form))
+    rondo = n_unique >= 3 and form.count(form[0]) >= 3 and all(form[i] == form[0] for i in range(0, len(form), 2))
+    res["2부 형식"] = _res(1 if form in ("AB", "AABB", "ABAB") else 0, f"섹션 {form}")
+    res["3부 형식"] = _res(1 if form in ("ABA", "ABCA") or (n_unique == 2 and form[0] == form[-1] and len(form) == 3) else 0, f"섹션 {form}")
+    res["론도 형식"] = _res(1 if rondo else 0, f"섹션 {form} (A 회귀 {form.count(form[0])}회)")
+    var = 0
+    if len(secs) >= 6:
+        ch = [estimate_key([n for n in notes if bars[i * per] <= n.onset_s < bars[min((i + 1) * per, len(bars) - 1)]]) for i in range(len(secs))]
+        bass = [min([n.pitch for n in notes if bars[i * per] <= n.onset_s < bars[min((i + 1) * per, len(bars) - 1)]] or [0]) for i in range(len(secs))]
+        var = 1 if n_unique >= 3 and len(set(bass)) <= 3 and sum(1 for i in range(1, len(secs)) if _cos(secs[i], secs[0]) < 0.97 and _cos(secs[i], secs[0]) > 0.6) >= 3 else 0
+    res["변주곡"] = _res(var, "같은 저음/화성 골격 위 선율 변화(추정)" if var else "")
+    mid = estimate_key([n for n in notes if bars[len(bars) // 3] <= n.onset_s < bars[2 * len(bars) // 3]])
+    first = estimate_key([n for n in notes if n.onset_s < bars[len(bars) // 3]])
+    last = estimate_key([n for n in notes if n.onset_s >= bars[2 * len(bars) // 3]])
+    sonata = first[:2] == last[:2] and mid[:2] != first[:2] and len(bars) >= 32 and mid[2] > 0.5
+    res["소나타 형식"] = _res(1 if sonata else 0, f"제시부 {_PC[first[0]]}{first[1][:3]} → 중간 {_PC[mid[0]]}{mid[1][:3]} → 재현 {_PC[last[0]]}{last[1][:3]} (추정)" if sonata else "")
+    res["제시부"] = _res(1 if sonata else 0, "곡 앞 1/3 (추정)" if sonata else "")
+    res["전개부(발전부)"] = _res(1 if sonata else 0, "곡 가운데 1/3: 조성이 달라짐 (추정)" if sonata else "")
+    res["재현부"] = _res(1 if sonata else 0, "곡 뒤 1/3: 으뜸조 복귀 (추정)" if sonata else "")
+    res["__form"] = form
+    return res
+
+
+def d_texture(notes):
+    if not notes:
+        return {}
+    end = max(n.offset_s for n in notes)
+    samples = [i * 0.1 for i in range(int(end / 0.1))]
+    cnt = []
+    for t in samples:
+        cnt.append(sum(1 for n in notes if n.onset_s <= t < n.offset_s))
+    cnt_nz = [c for c in cnt if c > 0]
+    mono = sum(1 for c in cnt_nz if c == 1) / len(cnt_nz) if cnt_nz else 0
+    cl = _clusters(notes)
+    chordal = sum(1 for c in cl if len(c) >= 3) / len(cl)
+    top = [c[-1].pitch for c in cl]
+    bot = [c[0].pitch for c in cl]
+    motion = 0
+    ind = 0
+    for i in range(1, len(cl)):
+        du, db = top[i] - top[i - 1], bot[i] - bot[i - 1]
+        if du and db:
+            motion += 1
+            ind += 1 if (du > 0) != (db > 0) else 0
+    contrary = ind / motion if motion else 0
+    sync = chordal
+    poly = contrary >= 0.4 and sync < 0.35 and sum(1 for c in cnt if c >= 3) / max(1, len(cnt)) > 0.4
+    return {"모노포니(단성음악)": _res(1 if mono >= 0.85 else 0, f"한 음만 울리는 시간 {mono:.0%}"),
+            "호모포니": _res(1 if chordal >= 0.35 and not poly else 0, f"3음 이상 동시 타건 비율 {chordal:.0%}"),
+            "폴리포니(대위법)": _res(1 if poly else 0, f"반진행 비율 {contrary:.0%}, 동시 타건 {sync:.0%}"),
+            "텍스처(짜임새)": _res(1, f"평균 동시 발음 {sum(cnt_nz) / len(cnt_nz):.1f}, 최대 {max(cnt)}" if cnt_nz else ""),
+            "동시발음수(보이스 폴리포니)": _res(max(cnt) if cnt else 0, f"최대 {max(cnt) if cnt else 0}음 동시")}
+
+
+def _bass_line(notes, hi=55):
+    return [c[0] for c in _clusters(notes) if c[0].pitch < hi]
+
+
+def d_patterns(notes, beat_s):
+    res = {}
+    cl = _clusters(notes)
+    # trill: >=6 alternating notes within 2 semitones, IOI < 0.13
+    seq = [c[-1] for c in cl]  # top line: inner / bass notes of the same chord must not interrupt a figure
+    trills = tremolo = gliss = rep = brokenoct = dbl = 0
+    i = 0
+    while i < len(seq) - 5:
+        run = [seq[i]]
+        j = i + 1
+        while j < len(seq) and seq[j].onset_s - seq[j - 1].onset_s < 0.14:
+            run.append(seq[j])
+            j += 1
+        ps = [n.pitch for n in run]
+        k = 0
+        while k < len(ps) - 5:  # maximal alternating / stepwise stretches inside the fast run
+            e = k + 2
+            while e < len(ps) and ps[e] == ps[e - 2] and ps[k] != ps[k + 1]:
+                e += 1
+            if e - k >= 6:
+                d = abs(ps[k] - ps[k + 1])
+                if d <= 2:
+                    trills += 1
+                elif d == 12:
+                    brokenoct += 1
+                else:
+                    tremolo += 1
+                k = e
+                continue
+            e = k + 1
+            while e < len(ps) and 0 < ps[e] - ps[e - 1] <= 3:
+                e += 1
+            f = k + 1
+            while f < len(ps) and 0 < ps[f - 1] - ps[f] <= 3:
+                f += 1
+            end_ = max(e, f)
+            if end_ - k >= 7 and run[end_ - 1].onset_s - run[k].onset_s < 1.2:
+                gliss += 1
+                k = end_
+                continue
+            k += 1
+        i = max(i + 1, j - 1) if len(run) < 6 else j
+    for c in cl:
+        pass
+    # tremolo of chords: alternating two chord shapes quickly
+    for a, b, c2, d in zip(cl, cl[1:], cl[2:], cl[3:]):
+        if len(a) >= 2 and [n.pitch for n in a] == [n.pitch for n in c2] and [n.pitch for n in b] == [n.pitch for n in d] and \
+                [n.pitch for n in a] != [n.pitch for n in b] and d.__class__ and (b[0].onset_s - a[0].onset_s) < 0.12:
+            tremolo += 1
+    res["트릴"] = _res(trills, "인접 두 음 빠른 교대")
+    res["트레몰로"] = _res(tremolo, "두 음/화음의 빠른 교대")
+    res["글리산도"] = _res(gliss, "8음 이상 스텝 진행이 1.2초 안")
+    bo = 0
+    k = 0
+    while k < len(seq) - 5:  # the same two pitches an octave apart, alternating at up to 8th-note speed
+        e = k + 2
+        while e < len(seq) and seq[e].pitch == seq[e - 2].pitch and abs(seq[k].pitch - seq[k + 1].pitch) == 12 and seq[e].onset_s - seq[e - 1].onset_s < 0.4:
+            e += 1
+        if e - k >= 6:
+            bo += 1
+            k = e
+        else:
+            k += 1
+    res["브로큰 옥타브"] = _res(max(brokenoct, bo), "옥타브 두 음 교대")
+    # repeated notes
+    r = 0
+    run = 1
+    for a, b in zip(seq, seq[1:]):
+        if a.pitch == b.pitch and 0.04 < b.onset_s - a.onset_s < 0.4:
+            run += 1
+            if run == 4:
+                r += 1
+        else:
+            run = 1
+    res["동음 연타"] = _res(r, "같은 음 4번 이상 연속")
+    # octave playing: simultaneous pairs ic 12 on the top line
+    octs = sum(1 for c in cl if len(c) >= 2 and c[-1].pitch - c[0].pitch == 12 and len(c) == 2)
+    octs_any = sum(1 for c in cl if any(c[-1].pitch - n.pitch == 12 for n in c[:-1]))
+    res["옥타브 주법"] = _res(octs_any if octs_any >= 4 else 0, f"옥타브 동시 발음 {octs_any}회")
+    # double notes: consecutive 3rds/6ths pairs
+    dn = 0
+    run = 0
+    for c in cl:
+        ok = len(c) == 2 and (c[1].pitch - c[0].pitch) in (3, 4, 8, 9)
+        run = run + 1 if ok else 0
+        if run == 4:
+            dn += 1
+    res["더블 노트(3도·6도 주법)"] = _res(dn, "3도/6도 병행 4연속 이상")
+    # rolled chords: onsets staggered 15-80 ms, >=3 notes ascending
+    roll = 0
+    s2 = sorted(notes, key=lambda n: n.onset_s)
+    k = 0
+    while k < len(s2) - 2:
+        g = [s2[k]]
+        m = k + 1
+        while m < len(s2) and 0.012 <= s2[m].onset_s - s2[m - 1].onset_s <= 0.08 and s2[m].pitch > s2[m - 1].pitch and len(g) < 8:
+            g.append(s2[m])
+            m += 1
+        if len(g) >= 3 and g[-1].onset_s - g[0].onset_s <= 0.25:
+            roll += 1
+            k = m
+        else:
+            k += 1
+    res["롤링 코드"] = _res(roll, "아래에서 위로 시차를 둔 화음")
+    # arpeggio / broken chord: notes of one triad played in sequence (ioi 0.07..0.45)
+    arp = 0
+    ln = [c[0] for c in cl]
+    run = []
+    for n in ln:
+        if run and (n.onset_s - run[-1].onset_s > 0.5 or n.onset_s - run[-1].onset_s < 0.07):
+            run = []
+        run.append(n)
+        pcs = {x.pitch % 12 for x in run}
+        if len(run) >= 4 and len(pcs) <= 4 and (max(x.pitch for x in run) - min(x.pitch for x in run)) >= 7 and len(pcs) >= 3:
+            if len(run) == 4:
+                arp += 1
+    res["분산화음(아르페지오)"] = _res(arp, "")
+    # Alberti: low-high-mid-high in bass register
+    alb = 0
+    bl = [n for n in sorted(notes, key=lambda n: n.onset_s) if n.pitch < 66]
+    for a, b, c3, d in zip(bl, bl[1:], bl[2:], bl[3:]):
+        if a.pitch < c3.pitch < b.pitch and b.pitch == d.pitch and d.onset_s - a.onset_s < 1.6 and b.pitch - a.pitch <= 12:
+            alb += 1
+    res["알베르티 베이스"] = _res(alb if alb >= 3 else 0, f"패턴 {alb}회")
+    # stride: single low note, then mid chord, alternating
+    stride = 0
+    run = 0
+    for a, b in zip(cl, cl[1:]):
+        low, ch = (a, b) if len(a) == 1 else (b, a)
+        ok = len(low) == 1 and low[0].pitch < 50 and len(ch) >= 3 and 48 <= ch[0].pitch <= 70 and (len(a) == 1) != (len(b) == 1)
+        run = run + 1 if ok else 0
+        if run == 6:
+            stride += 1
+    res["스트라이드 주법"] = _res(stride, "저음 단음 ↔ 중음역 화음 교대")
+    # walking bass: >= 6 bass notes, mostly stepwise (<=3), near-beat spacing
+    walk = 0
+    bs = _bass_line(notes, 55)
+    run = 1
+    for a, b in zip(bs, bs[1:]):
+        step = abs(b.pitch - a.pitch) <= 4 and a.pitch != b.pitch
+        gap = b.onset_s - a.onset_s
+        run = run + 1 if step and 0.6 * beat_s <= gap <= 1.4 * beat_s else 1
+        if run == 6:
+            walk += 1
+    res["워킹 베이스"] = _res(walk, "")
+    boogie = 0
+    pat = (0, 4, 7, 9, 10, 9, 7, 4)
+    pb = [n.pitch for n in bs]
+    for i in range(len(pb) - 8):
+        if all(pb[i + k] - pb[i] == pat[k] for k in range(8)):
+            boogie += 1
+    res["부기우기"] = _res(boogie, "1-3-5-6-♭7-6-5-3 베이스 패턴")
+    # comping: short offbeat mid-register chords
+    comp = 0
+    for c in cl:
+        if len(c) >= 3 and 48 <= c[0].pitch <= 72:
+            ph = (c[0].onset_s / beat_s) % 1.0
+            d = c[0].offset_s - c[0].onset_s
+            if 0.35 < ph < 0.65 and d < 0.6 * beat_s:
+                comp += 1
+    res["컴핑(Comping)"] = _res(comp if comp >= 6 else 0, f"오프비트 짧은 화음 {comp}회")
+    # ostinato: repeated pitch-interval pattern of length 3..6 at least 4 times back to back (any voice)
+    ost = 0
+    iv = [b.pitch - a.pitch for a, b in zip(ln, ln[1:])]
+    for L in (2, 3, 4, 6, 8):
+        for i in range(len(iv) - 4 * L):
+            blk = iv[i:i + L]
+            if len(set(blk)) > 1 and all(iv[i + m * L:i + (m + 1) * L] == blk for m in range(4)):
+                ost += 1
+                break
+    res["오스티나토"] = _res(ost, "")
+    return res
+
+
+def d_rhythm(notes, beat_s):
+    res = {}
+    bpm = 60.0 / beat_s
+    res["템포(BPM)"] = _res(1, f"약 {bpm:.0f} BPM · {tempo_term_ko(bpm)}")
+    for kw, (lo, hi) in (("라르고", (0, 50)), ("아다지오", (50, 66)), ("안단테", (66, 92)), ("모데라토", (92, 112)), ("알레그로", (112, 144)), ("프레스토", (144, 1e9))):
+        res[kw] = _res(1 if lo <= bpm < hi else 0, f"{bpm:.0f} BPM" if lo <= bpm < hi else "")
+    cl = _clusters(notes)
+    ons = [c[0].onset_s for c in cl]
+    durs = {"온음표": 0, "2분음표": 0, "4분음표": 0, "8분음표": 0, "16분음표": 0}
+    dotted = 0
+    for a, b in zip(ons, ons[1:]):
+        q = (b - a) / beat_s
+        for name, v in (("온음표", 4.0), ("2분음표", 2.0), ("4분음표", 1.0), ("8분음표", 0.5), ("16분음표", 0.25)):
+            if abs(q - v) <= 0.12 * v:
+                durs[name] += 1
+            if abs(q - 1.5 * v) <= 0.12 * v:
+                dotted += 1
+    for name, v in durs.items():
+        res[name] = _res(v, "IOI 기준 박 길이 일치")
+    res["음표"] = _res(len(notes), "")
+    res["점음표"] = _res(dotted, "1.5배 길이")
+    rest = sum(1 for a, b in zip(cl, cl[1:]) if b[0].onset_s - max(n.offset_s for n in a) > 0.45 * beat_s)
+    res["쉼표"] = _res(rest, "소리가 완전히 끊기는 구간")
+    trip = 0
+    synco = 0
+    for band in ([c for c in cl if c[-1].pitch >= 60], [c for c in cl if c[0].pitch < 60]):
+        by_beat: dict[int, list[float]] = {}
+        for c in band:
+            by_beat.setdefault(int(c[0].onset_s // beat_s), []).append((c[0].onset_s % beat_s) / beat_s)
+        for ph in by_beat.values():
+            if len(ph) == 3 and abs(ph[1] - ph[0] - 1 / 3) < 0.07 and abs(ph[2] - ph[1] - 1 / 3) < 0.07:
+                trip += 1
+            elif len(ph) == 6 and all(abs((ph[i + 1] - ph[i]) - 1 / 6) < 0.05 for i in range(5)):
+                trip += 1
+    for c in cl:
+        ph = (c[0].onset_s / beat_s) % 1.0
+        if 0.4 < ph < 0.6 and max(n.offset_s for n in c) - c[0].onset_s > 0.9 * beat_s and not any(abs(((x[0].onset_s / beat_s) % 1.0) - 0) < 0.1 and c[0].onset_s < x[0].onset_s < c[0].onset_s + beat_s for x in cl[:0]):
+            synco += 1
+    res["셋잇단음표"] = _res(trip, "한 박에 균등 3분할")
+    res["당김음(싱코페이션)"] = _res(synco if synco >= 4 else 0, f"오프비트에서 시작해 다음 박을 넘기는 음 {synco}개")
+    hemi = 0
+    lo = [c for c in cl if c[0].pitch < 60]
+    hi = [c for c in cl if c[-1].pitch >= 60]
+    bar = 2 * beat_s * 1.5
+    t = 0.0
+    end = ons[-1] if ons else 0
+    while t < end:
+        lw = [c[0].onset_s - t for c in lo if t <= c[0].onset_s < t + bar]
+        hw = [c[-1].onset_s - t for c in hi if t <= c[-1].onset_s < t + bar]
+        def even(xs, n):
+            return len(xs) == n and all(abs((xs[i + 1] - xs[i]) - bar / n) < 0.1 * bar / n for i in range(n - 1))
+        if (even(lw, 2) and even(hw, 3)) or (even(lw, 3) and even(hw, 2)):
+            hemi += 1
+        t += bar
+    res["폴리리듬"] = _res(hemi, "양손이 2:3으로 어긋나게 균등 분할")
+    res["헤미올라"] = _res(hemi, "3박 마디 안 2:3 재그룹(폴리리듬 근거와 동일, 추정)")
+    return res
+
+
+def d_dynamics(notes, pedals):
+    res = {}
+    if not notes:
+        return res
+    end = max(n.offset_s for n in notes)
+    wins = []
+    t = 0.0
+    while t < end:
+        v = [n.velocity for n in notes if t <= n.onset_s < t + 2.0]
+        wins.append(_med(v) if v else None)
+        t += 2.0
+    cnt = {k: 0 for k, _, _ in _DYN}
+    for w in wins:
+        if w is not None:
+            for k, lo, hi in _DYN:
+                if lo <= w < hi:
+                    cnt[k] += 1
+    names = {"pp": "피아니시모(pp)", "p": "피아노(p)", "mp": "메조피아노(mp)", "mf": "메조포르테(mf)", "f": "포르테(f)", "ff": "포르티시모(ff)"}
+    for k, v in cnt.items():
+        res[names[k]] = _res(v, f"2초 구간 {v}개")
+    res["셈여림(Dynamics)"] = _res(len([w for w in wins if w is not None]), f"중앙 벨로시티 {_med([n.velocity for n in notes]):.0f}")
+    cre = dec = 0
+    vs = [w for w in wins if w is not None]
+    for i in range(len(vs) - 2):
+        if vs[i + 2] - vs[i] >= 12 and vs[i + 1] >= vs[i]:
+            cre += 1
+        if vs[i] - vs[i + 2] >= 12 and vs[i + 1] <= vs[i]:
+            dec += 1
+    res["크레셴도"] = _res(cre, "4초 안에 벨로시티 +12 이상")
+    res["데크레셴도"] = _res(dec, "4초 안에 벨로시티 -12 이상")
+    sfz = fp = 0
+    seq = sorted(notes, key=lambda n: n.onset_s)
+    for i, n in enumerate(seq):
+        loc = [m.velocity for m in seq[max(0, i - 12):i]]
+        if loc and n.velocity >= _med(loc) + 30:
+            sfz += 1
+            nxt = [m.velocity for m in seq[i + 1:i + 6] if m.onset_s - n.onset_s < 1.0]
+            if nxt and _med(nxt) <= n.velocity - 25:
+                fp += 1
+    res["스포르찬도(sfz)"] = _res(sfz, "직전 평균보다 벨로시티 +30 이상")
+    res["포르테피아노(fp)"] = _res(fp, "강한 타건 직후 약화")
+    # articulation
+    cl = _clusters(notes)
+    arts = {"legato": 0, "legatissimo": 0, "staccato": 0, "staccatissimo": 0, "tenuto": 0, "portato": 0, "nonlegato": 0, "accent": 0, "marcato": 0, "martellato": 0}
+    for a, b in zip(cl, cl[1:]):
+        ioi = b[0].onset_s - a[0].onset_s
+        if ioi < 0.05 or ioi > 1.5:
+            continue
+        n = a[-1]
+        r = (n.offset_s - n.onset_s) / ioi
+        if r >= 1.15:
+            arts["legatissimo"] += 1
+        if r >= 1.0:
+            arts["legato"] += 1
+        elif r >= 0.95:
+            arts["tenuto"] += 1
+        elif r >= 0.75:
+            arts["nonlegato"] += 1
+        elif r >= 0.45:
+            arts["portato"] += 1
+        else:
+            arts["staccato"] += 1
+            if r < 0.25 and n.offset_s - n.onset_s < 0.12:
+                arts["staccatissimo"] += 1
+    for i, c in enumerate(cl):
+        loc = [x[-1].velocity for x in cl[max(0, i - 8):i]]
+        if loc and c[-1].velocity >= _med(loc) + 15:
+            arts["accent"] += 1
+            if c[-1].velocity >= _med(loc) + 20 and (c[-1].offset_s - c[-1].onset_s) < 0.4:
+                arts["marcato"] += 1
+            if len(c) >= 2 and c[-1].velocity >= 100:
+                arts["martellato"] += 1
+    for kw, key in (("레가토", "legato"), ("레가티시모", "legatissimo"), ("스타카토", "staccato"), ("스타카티시모", "staccatissimo"), ("테누토", "tenuto"),
+                    ("포르타토", "portato"), ("논 레가토", "nonlegato"), ("악센트", "accent"), ("마르카토", "marcato"), ("마르텔라토", "martellato")):
+        res[kw] = _res(arts[key], "음 길이 ÷ 다음 타건까지 간격 기준" if key not in ("accent", "marcato", "martellato") else "벨로시티 기준")
+    res["아티큘레이션"] = _res(sum(arts[k] for k in ("legato", "staccato", "tenuto", "portato", "nonlegato")), "")
+    # fermata: very long note followed by silence/change
+    ferm = sum(1 for a, b in zip(cl, cl[1:]) if (max(n.offset_s for n in a) - a[0].onset_s) > 3.0 * max(0.2, _med([x[0].offset_s - x[0].onset_s for x in cl[:200]])) and (max(n.offset_s for n in a) - a[0].onset_s) > 1.5)
+    res["페르마타"] = _res(ferm, "중앙값의 3배 이상 길게 유지(템포 완화 포함)")
+    return res
+
+
+def d_pedal(pedals, notes):
+    res = {}
+    n = len(pedals)
+    res["서스테인 페달"] = _res(n, f"페달 구간 {n}개, 총 {sum(p.offset_s - p.onset_s for p in pedals):.1f}s")
+    res["CC64(서스테인 페달 메시지)"] = _res(n, "0/127 이진 값으로 기록")
+    flutter = 0
+    ps = sorted(pedals, key=lambda p: p.onset_s)
+    for i in range(len(ps) - 3):
+        if ps[i + 3].onset_s - ps[i].onset_s < 2.0 and all(p.offset_s - p.onset_s < 0.45 for p in ps[i:i + 4]):
+            flutter += 1
+    res["플러터 페달"] = _res(flutter, "2초 안 짧은 페달 4회 이상")
+    synco = 0
+    ons = sorted(n_.onset_s for n_ in notes)
+    import bisect
+    for p in ps:
+        j = bisect.bisect_left(ons, p.onset_s)
+        if j < len(ons) and 0.0 <= ons[j] - p.onset_s <= 0.0 and False:
+            pass
+    for a, b in zip(ps, ps[1:]):
+        gap = b.onset_s - a.offset_s
+        if 0 <= gap < 0.12:
+            j = bisect.bisect_left(ons, a.offset_s - 0.03)
+            if j < len(ons) and ons[j] <= b.onset_s + 0.03:
+                synco += 1
+    res["싱코페이티드 페달링"] = _res(synco, "건반을 친 직후에 페달을 바꿔 밟음(페달 교체 후 음이 이어짐)")
+    for kw, why in (("하프 페달", "CC64를 0/127 이진값으로만 기록 — 중간 값(부분 페달)은 오디오에서 복원하지 않음"),
+                    ("쿼터 페달", "CC64 중간 값 미기록"), ("소프트 페달(우나 코르다)", "CC67 미기록(악보에 una corda 제안만 표기)"),
+                    ("소스테누토 페달", "CC66 미기록(악보에 sostenuto 제안만 표기)")):
+        res[kw] = {"found": False, "count": 0, "detail": why, "status": "not_recoverable"}
+    return res
+
+
+def seq_by_onset(notes):
+    return sorted(notes, key=lambda n: n.onset_s)
+
+
+def d_structure(notes, beat_s):
+    res = {}
+    cl = _clusters(notes)
+    gaps = [0.0] + [b[0].onset_s - max(n.offset_s for n in a) for a, b in zip(cl, cl[1:])]
+    cuts = [i for i, g in enumerate(gaps) if g > 1.5 * beat_s]
+    phrases = max(1, len(cuts) + 1)
+    res["프레이즈(악구)"] = _res(phrases, "쉼 1.5박 이상으로 구분")
+    res["프레이징"] = _res(phrases, "")
+    mel = [c[-1].pitch for c in cl if c[-1].pitch >= 55]
+    ivs = [b - a for a, b in zip(mel, mel[1:])]
+    grams: dict[tuple, int] = {}
+    for i in range(len(ivs) - 4):
+        g = tuple(ivs[i:i + 4])
+        if len(set(g)) > 1:
+            grams[g] = grams.get(g, 0) + 1
+    top = max(grams.items(), key=lambda kv: kv[1], default=(None, 0))
+    res["모티프(동기)"] = _res(1 if top[1] >= 3 else 0, f"4음 음정 패턴 {list(top[0])} 이(가) {top[1]}회 반복" if top[1] >= 3 else "")
+    # voicing: how many notes sit in the top line, the bass and the inner voices
+    top_n = sum(1 for c in cl)
+    inner = sum(max(0, len(c) - 2) for c in cl)
+    bass_n = sum(1 for c in cl if len(c) >= 2)
+    res["보이싱(성부 분리)"] = _res(len(cl), f"상성부 {top_n} · 저성부 {bass_n} · 내성부 {inner}음")
+    short = 0
+    for a, b in zip(seq_by_onset(notes), seq_by_onset(notes)[1:]):
+        if (a.offset_s - a.onset_s) < 0.07 and 0 < b.onset_s - a.onset_s < 0.13 and (b.offset_s - b.onset_s) >= 3 * (a.offset_s - a.onset_s) and abs(b.pitch - a.pitch) <= 2 and a.pitch != b.pitch:
+            short += 1
+    res["꾸밈음(전타음)"] = _res(short, "아주 짧은 음(<70ms)이 인접한 긴 음 바로 앞에서 울림")
+    res["__phrase_cuts"] = cuts
+    return res
+
+
+def d_solo_styles(notes, beat_s, form_str, chords, res_all):
+    bpm = 60.0 / beat_s
+    cl = _clusters(notes)
+    fast = sum(1 for a, b in zip(cl, cl[1:]) if 0.0 < b[0].onset_s - a[0].onset_s < 0.16) / max(1, len(cl))
+    runs = res_all.get("virtuoso", 0)
+    arp = res_all.get("분산화음(아르페지오)", {}).get("count", 0)
+    lines = {
+        "독주(솔로)": _res(1, "피아노 한 대 악기로 변환된 결과"),
+        "비르투오소": _res(1 if fast > 0.45 and bpm >= 100 else 0, f"빠른 음 비율 {fast:.0%}, {bpm:.0f} BPM"),
+        "에튀드(연습곡)": _res(1 if fast > 0.55 else 0, "한 가지 빠른 음형이 곡 전체를 지속(휴리스틱)"),
+        "녹턴(야상곡)": _res(1 if bpm < 85 and arp >= 4 else 0, "느린 템포 + 분산화음 반주 + 노래하는 선율(휴리스틱)"),
+        "발라드": _res(1 if bpm < 90 and fast < 0.2 else 0, "느림 + 단순한 짜임새(휴리스틱)"),
+        "전주곡": _res(1 if arp >= 8 and fast > 0.3 else 0, "한 가지 분산화음 음형 지속(휴리스틱)"),
+        "환상곡": _res(0, "자유로운 형식은 악보 정보만으로 판정하지 않음"),
+        "즉흥곡": _res(0, "즉흥성은 악보 정보만으로 판정하지 않음"),
+        "협주곡": {"found": False, "count": 0, "detail": "오케스트라 파트 없음(피아노 독주 변환)", "status": "not_applicable"},
+        "소나타": _res(1 if res_all.get("sonata") else 0, "소나타 형식 판정과 동일(추정)"),
+        "칸타빌레": _res(1 if res_all.get("cantabile", 0) >= 0.6 else 0, f"선율 레가토 비율 {res_all.get('cantabile', 0):.0%} (노래하듯, 추정)"),
+    }
+    return lines
+
+
+def d_cantabile(notes):
+    cl = _clusters(notes)
+    top = [c[-1] for c in cl if c[-1].pitch >= 60]
+    if len(top) < 8:
+        return 0.0
+    leg = 0
+    tot = 0
+    for a, b in zip(top, top[1:]):
+        ioi = b.onset_s - a.onset_s
+        if 0.2 <= ioi <= 2.0:
+            tot += 1
+            leg += 1 if a.offset_s >= b.onset_s - 0.03 else 0
+    return leg / tot if tot else 0.0
+
+
+def _virtuosic(notes):
+    seq = sorted(notes, key=lambda n: n.onset_s)
+    runs, cur = 0, 1
+    for a, b in zip(seq, seq[1:]):
+        if 0 < b.onset_s - a.onset_s < 0.09:
+            cur += 1
+            if cur == 8:
+                runs += 1
+        else:
+            cur = 1
+    return runs
+
+
+def d_hands(musicxml_path):
+    """Thumb-under and hand-crossing hints from the fingered grand staff (piano.musicxml), if present."""
+    out = {"운지 번호": _res(0), "엄지 넘기기": _res(0), "손 교차": _res(0)}
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.parse(str(musicxml_path)).getroot()
+    except Exception:
+        return out
+    fing = under = cross = 0
+    for part in root.iter("part"):
+        hands: dict[int, list[tuple[int, int]]] = {1: [], 2: []}
+        step_pc = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+        for meas in part.iter("measure"):
+            hi, lo = [], []
+            for note in meas.iter("note"):
+                p = note.find("pitch")
+                if p is None:
+                    continue
+                midi = (int(p.findtext("octave", "4")) + 1) * 12 + step_pc[p.findtext("step", "C")] + int(float(p.findtext("alter", "0")))
+                staff = int(note.findtext("staff", "1"))
+                f = note.find(".//fingering")
+                if f is not None and (f.text or "").strip().isdigit():
+                    fing += 1
+                    hands.setdefault(staff, []).append((midi, int(f.text.strip())))
+                (hi if staff == 1 else lo).append(midi)
+            if hi and lo and max(lo) > min(hi):
+                cross += 1
+        for staff, seq in hands.items():
+            for (p1, f1), (p2, f2) in zip(seq, seq[1:]):
+                asc = p2 > p1 and p2 - p1 <= 4
+                desc = p2 < p1 and p1 - p2 <= 4
+                if (staff == 1 and asc and f2 == 1 and f1 in (3, 4)) or (staff == 2 and desc and f2 == 1 and f1 in (3, 4)):
+                    under += 1
+    out["운지 번호"] = _res(fing, "piano.musicxml 에 기입된 운지 수")
+    out["엄지 넘기기"] = _res(under, "음계형 진행에서 3·4 → 1")
+    out["손 교차"] = _res(cross, "왼손 보표 음이 같은 마디 오른손 최저음보다 높은 마디 수(추정)")
+    return out
+
+
+# ----------------------------------------------------------------------------------------- registry
+# status of keywords that are not detectors: where the pipeline already outputs them, what the renderer
+# does, and what is physically impossible to recover from an MP3/WAV -> MIDI.
+_SCORE = "MusicXML 큰보표(piano.musicxml)에 출력"
+_STATIC: dict[str, tuple[str, str]] = {}
+for _k in ("큰보표", "높은음자리표", "낮은음자리표", "가온다", "덧줄", "옥타브 기호(8va/8vb)", "조표", "임시표", "올림표(샵)", "내림표(플랫)", "제자리표(내추럴)", "더블샵", "더블플랫",
+           "마디", "세로줄", "박자표", "붙임줄", "이음줄", "리타르단도", "아첼레란도", "아 템포", "템포 루바토", "도돌이표", "서스테인 페달 기호"):
+    _STATIC[_k] = ("output", _SCORE + " (더블샵/더블플랫은 조표 철자상 필요할 때만)")
+for _k in ("볼타", "다 카포(D.C.)", "달 세뇨(D.S.)", "코다(Coda)", "피네(Fine)"):
+    _STATIC[_k] = ("not_output", "정확히 같은 구간 반복은 도돌이표로 출력하지만, 반복 지시어(D.C./D.S./Coda/Fine/볼타)는 자동 판정하지 않음 — 연주자의 작곡 의도 정보라 오디오에서 복원 불가")
+for _k, _v in {
+        "피아노 액션 구조": "악기 내부 구조 — 오디오/MIDI에 없음", "해머": "악기 내부 구조 — 오디오/MIDI에 없음", "이스케이프먼트": "악기 내부 구조 — 오디오/MIDI에 없음",
+        "더블 이스케이프먼트": "악기 내부 구조(빠른 연타 가능 여부는 동음 연타 검출로 간접 확인)", "향판(사운드보드)": "악기 내부 구조 — 렌더 음색(SoundFont 샘플)에 이미 포함",
+        "브릿지": "악기 내부 구조", "주철 프레임": "악기 내부 구조", "댐퍼": "악기 내부 구조(페달 CC64로 댐퍼 동작만 기록)", "튜닝 핀": "악기 내부 구조", "조율": "녹음 악기의 실제 조율은 MIDI에 없음(렌더는 A4=440Hz)",
+        "순정률": "MIDI는 평균율 음높이만 표현", "피타고라스 음률": "MIDI는 평균율 음높이만 표현",
+        "인토네이션(해머 보이싱)": "해머 펠트 상태 — 오디오 음색 분석 영역(복원 불가)", "프리페어드 피아노": "특수 주법 음색은 음높이 MIDI로 구분 불가",
+        "피아노 현 직접 주법(인사이드 피아노)": "특수 주법 음색은 음높이 MIDI로 구분 불가", "피아노 피치카토": "특수 주법 음색은 음높이 MIDI로 구분 불가",
+        "피아노 하모닉스": "특수 주법 음색은 음높이 MIDI로 구분 불가", "애프터터치": "ByteDance/Transkun 모델이 출력하지 않음(피아노 건반은 대부분 애프터터치 없음)",
+        "피치벤드": "피아노 음높이는 고정 — 모델 출력 없음", "릴리즈 트리거": "렌더러(FluidSynth) 샘플 기능 — MIDI 정보 아님",
+        "물리 모델링": "렌더는 샘플 기반(Salamander 16 벨로시티 레이어) — 물리 모델 합성 아님", "스테레오 마이킹(A/B·X/Y·ORTF)": "MP3에는 실제 마이크 배열 메타데이터가 없음",
+        "피아노 리드 각도 조절": "녹음 시 뚜껑 각도 — 오디오에서 복원 불가", "팔 무게 주법": "연주 동작(신체) 정보 — MIDI/오디오로 복원 불가", "릴랙세이션(이완)": "연주 동작(신체) 정보 — 복원 불가",
+        "멀티 벨로시티 레이어 샘플링": "렌더 단계에서 사용(Salamander 16단계 벨로시티 레이어)", "위상 정합(Phase)": "정규화 단계에서 스테레오→모노 위상 손실 경고로 점검"}.items():
+    _STATIC[_k] = ("not_recoverable" if _k not in ("멀티 벨로시티 레이어 샘플링", "위상 정합(Phase)") else "rendered", _v)
+for _k in ("음색(Timbre)", "배음(Overtone)", "공명(Resonance)"):
+    _STATIC[_k] = ("analyzed", "음색 분석은 style 단계, 공명은 렌더(홀 리버브·SoundFont 공명)에서 처리 — MIDI 음표 자체에 값이 없음")
+for _k in ("MIDI", "벨로시티"):
+    _STATIC[_k] = ("output", "piano.mid 로 출력(벨로시티 1~127)")
+_STATIC["반음"] = ("derived", "멜로디 반음 진행 검출 참조")
+_STATIC["평균율"] = ("rendered", "MIDI 음높이는 12평균율, 렌더는 A4=440Hz 평균율(순정률·피타고라스 음률은 MIDI로 표현 불가)")
+
+
+def analyze_keywords(notes, pedals, *, bars=None, musicxml=None, beat_s=None):
+    """notes: objects with onset_s/offset_s/pitch/velocity; pedals: onset_s/offset_s. Returns the full report."""
+    notes = [n for n in notes if n.offset_s > n.onset_s]
+    out: dict[str, dict] = {}
+    if not notes:
+        return {"keywords": {}, "summary": {"error": "음표가 없습니다"}}
+    beat = beat_s or estimate_beat(notes)
+    key = estimate_key(notes)
+    bars = list(bars) if bars and len(bars) >= 2 else [i * beat * 4 for i in range(int(max(n.offset_s for n in notes) / (beat * 4)) + 2)]
+    out.update(d_pitch(notes))
+    out.update(d_intervals(notes))
+    sc = d_scale(notes, key)
+    chrom = sc.pop("__chromatic_share")
+    out.update(sc)
+    chords = chord_track(notes, beat, key[0])
+    st = d_structure(notes, beat)
+    cuts = st.pop("__phrase_cuts")
+    cuts_chord = [max(0, min(len(chords) - 1, int(c * len(chords) / max(1, len(_clusters(notes)))) - 1)) for c in cuts]
+    out.update(st)
+    out.update(d_chords(chords, key, notes, cuts_chord))
+    out.update(d_dissonance(notes))
+    out.update(d_tonality(notes, key))
+    out.update(d_modulation(notes, key))
+    fm = d_form(notes, bars, key)
+    form_str = fm.pop("__form", "")
+    out.update(fm)
+    out.update(d_texture(notes))
+    out.update(d_patterns(notes, beat))
+    out.update(d_rhythm(notes, beat))
+    out.update(d_dynamics(notes, pedals))
+    out.update(d_pedal(pedals, notes))
+    if musicxml and __import__("os").path.isfile(str(musicxml)):
+        out.update(d_hands(musicxml))
+    else:
+        for k in ("운지 번호", "엄지 넘기기", "손 교차"):
+            out[k] = {"found": False, "count": 0, "detail": "piano.musicxml 이 없어 판정하지 못함", "status": "unavailable"}
+    iv = (0, 2, 4, 5, 7, 9, 11) if key[1] == "major" else (0, 2, 3, 5, 7, 8, 10, 11)
+    acc = sum(1 for n in notes if (n.pitch - key[0]) % 12 not in iv)
+    out["임시표"] = _res(acc, f"조표(추정 조성) 밖 음 {acc}개 = {acc / len(notes):.0%} (악보에는 임시표로 출력)")
+    for kw in ("올림표(샵)", "내림표(플랫)", "제자리표(내추럴)"):
+        out[kw] = {"found": True, "count": 0, "detail": _SCORE + " (조표·임시표 철자에 따라 자동 선택)", "status": "output"}
+    cant = d_cantabile(notes)
+    ctx = {"virtuoso": _virtuosic(notes), "cantabile": cant, "sonata": out.get("소나타 형식", {}).get("found"),
+           "분산화음(아르페지오)": out.get("분산화음(아르페지오)", {})}
+    out.update(d_solo_styles(notes, beat, form_str, chords, ctx))
+    for k, (status, why) in _STATIC.items():
+        if k not in out:
+            out[k] = {"found": status in ("output", "rendered", "derived", "analyzed"), "count": 0, "detail": why, "status": status}
+    for k, v in out.items():
+        if "status" not in v:
+            v["status"] = "detected" if v.get("found") else "not_found"
+    bpm = 60.0 / beat
+    summary = {"조성(추정)": f"{_PC[key[0]]} {key[1]}", "조성 상관": round(key[2], 3), "템포(BPM)": round(bpm, 1), "템포 용어": tempo_term_ko(bpm), "형식": form_str,
+               "음표 수": len(notes), "곡 길이(s)": round(max(n.offset_s for n in notes), 1)}
+    return {"summary": summary, "keywords": out}
+
+
+def keywords_markdown(report, wanted):
+    """Markdown with one row per requested keyword (in the user's order) so nothing is silently missing."""
+    kw = report["keywords"]
+    icon = {"detected": "✅ 검출", "not_found": "➖ 이 곡에는 없음", "output": "📄 출력", "rendered": "🎹 렌더", "derived": "🧮 파생",
+            "analyzed": "🔬 분석", "not_recoverable": "⛔ 복원 불가", "not_output": "⚠️ 자동 판정 안 함", "not_applicable": "— 해당 없음",
+            "unavailable": "… 판정 불가"}
+    lines = ["# 키워드 검출 리포트", "", "> 오디오→MIDI 변환은 확률 모델이라 원곡과 100% 일치를 보장할 수 없습니다. 아래는 변환 결과(MIDI)에서 **실제로 근거가 잡힌 것**과 **원리상 복원할 수 없는 것**을 구분한 표입니다. 정확도는 참조 MIDI를 함께 올리면 evaluation 단계의 F-measure로 측정됩니다.", ""]
+    for k, v in report["summary"].items():
+        lines.append(f"- **{k}**: {v}")
+    lines += ["", "| 키워드 | 상태 | 횟수 | 근거 |", "|---|---|---|---|"]
+    for k in wanted:
+        v = kw.get(k)
+        if v is None:
+            lines.append(f"| {k} | ⚠️ 미등록 | | |")
+        else:
+            lines.append(f"| {k} | {icon.get(v['status'], v['status'])} | {v.get('count', '')} | {str(v.get('detail', '')).replace('|', '/')[:160]} |")
+    return "\n".join(lines) + "\n"
+
+
+KEYWORD_LIST: tuple[str, ...] = (
+    '큰보표',
+    '높은음자리표',
+    '낮은음자리표',
+    '가온다',
+    '덧줄',
+    '옥타브 기호(8va/8vb)',
+    '조표',
+    '임시표',
+    '올림표(샵)',
+    '내림표(플랫)',
+    '제자리표(내추럴)',
+    '더블샵',
+    '더블플랫',
+    '88건반',
+    '반음',
+    '온음',
+    '마디',
+    '세로줄',
+    '박자표',
+    '음표',
+    '온음표',
+    '2분음표',
+    '4분음표',
+    '8분음표',
+    '16분음표',
+    '점음표',
+    '쉼표',
+    '셋잇단음표',
+    '붙임줄',
+    '이음줄',
+    '당김음(싱코페이션)',
+    '템포(BPM)',
+    '라르고',
+    '아다지오',
+    '안단테',
+    '모데라토',
+    '알레그로',
+    '프레스토',
+    '리타르단도',
+    '아첼레란도',
+    '아 템포',
+    '템포 루바토',
+    '피아니시모(pp)',
+    '피아노(p)',
+    '메조피아노(mp)',
+    '메조포르테(mf)',
+    '포르테(f)',
+    '포르티시모(ff)',
+    '크레셴도',
+    '데크레셴도',
+    '스포르찬도(sfz)',
+    '포르테피아노(fp)',
+    '레가토',
+    '레가티시모',
+    '스타카토',
+    '스타카티시모',
+    '포르타토',
+    '테누토',
+    '악센트',
+    '마르카토',
+    '마르텔라토',
+    '논 레가토',
+    '페르마타',
+    '서스테인 페달',
+    '소프트 페달(우나 코르다)',
+    '소스테누토 페달',
+    '하프 페달',
+    '쿼터 페달',
+    '플러터 페달',
+    '싱코페이티드 페달링',
+    '운지 번호',
+    '엄지 넘기기',
+    '손 교차',
+    '팔 무게 주법',
+    '릴랙세이션(이완)',
+    '칸타빌레',
+    '화음(코드)',
+    '롤링 코드',
+    '분산화음(아르페지오)',
+    '알베르티 베이스',
+    '스트라이드 주법',
+    '보이싱(성부 분리)',
+    '동음 연타',
+    '옥타브 주법',
+    '브로큰 옥타브',
+    '더블 노트(3도·6도 주법)',
+    '대도약',
+    '트릴',
+    '트레몰로',
+    '꾸밈음(전타음)',
+    '글리산도',
+    '폴리리듬',
+    '헤미올라',
+    '오스티나토',
+    '프레이징',
+    '아티큘레이션',
+    '도돌이표',
+    '볼타',
+    '다 카포(D.C.)',
+    '달 세뇨(D.S.)',
+    '코다(Coda)',
+    '피네(Fine)',
+    '음높이(Pitch)',
+    '음의 길이(Duration)',
+    '셈여림(Dynamics)',
+    '음색(Timbre)',
+    '배음(Overtone)',
+    '공명(Resonance)',
+    '음정(Interval)',
+    '음계(Scale)',
+    '장음계',
+    '단음계',
+    '펜타토닉',
+    '블루스 스케일',
+    '선법(모드)',
+    '기능화성',
+    '으뜸화음(토닉)',
+    '버금딸림화음(서브도미넌트)',
+    '딸림화음(도미넌트)',
+    '종지법',
+    '정격종지',
+    '반종지',
+    '위종지',
+    '전조(조바꿈)',
+    '협화음',
+    '불협화음',
+    '화성 해결',
+    '텐션 코드(9th·11th·13th)',
+    '투파이브원(II-V-I)',
+    '대리화음(트라이톤 서브스티튜션)',
+    '세컨더리 도미넌트',
+    '모달 인터체인지',
+    '증화음(어그먼트)',
+    '감화음(디미니쉬)',
+    '클러스터 화음',
+    '12음기법',
+    '무조성(Atonality)',
+    '복조성(Bitonality/Polytonality)',
+    '모티프(동기)',
+    '프레이즈(악구)',
+    '2부 형식',
+    '3부 형식',
+    '소나타 형식',
+    '론도 형식',
+    '변주곡',
+    '제시부',
+    '전개부(발전부)',
+    '재현부',
+    '텍스처(짜임새)',
+    '모노포니(단성음악)',
+    '호모포니',
+    '폴리포니(대위법)',
+    '소나타',
+    '녹턴(야상곡)',
+    '에튀드(연습곡)',
+    '발라드',
+    '환상곡',
+    '즉흥곡',
+    '전주곡',
+    '협주곡',
+    '비르투오소',
+    '독주(솔로)',
+    '피아노 액션 구조',
+    '해머',
+    '이스케이프먼트',
+    '더블 이스케이프먼트',
+    '향판(사운드보드)',
+    '브릿지',
+    '주철 프레임',
+    '댐퍼',
+    '튜닝 핀',
+    '조율',
+    '평균율',
+    '순정률',
+    '피타고라스 음률',
+    '인토네이션(해머 보이싱)',
+    '프리페어드 피아노',
+    '피아노 현 직접 주법(인사이드 피아노)',
+    '피아노 피치카토',
+    '피아노 하모닉스',
+    '컴핑(Comping)',
+    '워킹 베이스',
+    '부기우기',
+    '블루노트',
+    'MIDI',
+    '벨로시티',
+    'CC64(서스테인 페달 메시지)',
+    '애프터터치',
+    '피치벤드',
+    '멀티 벨로시티 레이어 샘플링',
+    '릴리즈 트리거',
+    '물리 모델링',
+    '동시발음수(보이스 폴리포니)',
+    '스테레오 마이킹(A/B·X/Y·ORTF)',
+    '피아노 리드 각도 조절',
+    '위상 정합(Phase)',
+)
+
+
 _SAVE_LOCK = threading.Lock()
 
 
@@ -888,6 +2098,18 @@ class App:
             event_log("refine_failed", job=job.id, traceback=traceback.format_exc())
         job.save()
 
+    def _write_keywords(self, job: Job) -> None:
+        """keywords_report.md/json: which of the requested music keywords the converted MIDI really shows.
+        An analysis problem never fails the conversion."""
+        try:
+            notes, pedals = self.tr.read_midi(job.out / "piano.mid")
+            bars = self.roll(job).get("bars") or None
+            rep = analyze_keywords(notes, pedals, bars=bars, musicxml=job.out / "piano.musicxml")
+            (job.out / "keywords_report.json").write_text(json.dumps(rep, ensure_ascii=False, indent=1), encoding="utf-8")
+            (job.out / "keywords_report.md").write_text(keywords_markdown(rep, KEYWORD_LIST), encoding="utf-8")
+        except Exception:
+            event_log("keywords_failed", job=job.id, traceback=traceback.format_exc())
+
     def pl_device(self, job: Job) -> str:
         return self.tr.resolve_device(job.options.get("device", "auto"))
 
@@ -942,6 +2164,7 @@ class App:
                 Path(job.audio), job.out, reference=Path(job.reference) if job.reference else None,
                 use_cache=not job.options.get("no_cache", False))
             make_preview(job.out / "piano.wav")
+            self._write_keywords(job)
             job.state, job.stage, job.intermediates_cleared = "done", None, False
             job.summary = list(summary.evaluation.get("summary", ()))
             job.duration_s = job.duration_s or float(summary.audio_duration_s)
@@ -1984,7 +3207,7 @@ const PRESETS={
   fidelity:{quality:"max",notes:"max",room:"hall",piano:"auto",piano_source:"nodrums",pedal:true,snap:true,piano_type:"grand",texture:"clean",mech:"none"}
 };
 const VOLATILE=["elapsed_s","stage_elapsed_s","eta_s","progress","progress_label","queue_position"];
-const FILES={"piano.mid":"MIDI","piano.musicxml":"악보 (MusicXML)","prompt.txt":"AI 음악 프롬프트","piano.wav":"WAV","report.md":"리포트","report.json":"리포트 JSON","run_summary.json":"처리 시간"};
+const FILES={"piano.mid":"MIDI","piano.musicxml":"악보 (MusicXML)","prompt.txt":"AI 음악 프롬프트","piano.wav":"WAV","report.md":"리포트","keywords_report.md":"키워드 검출 리포트","keywords_report.json":"키워드 JSON","report.json":"리포트 JSON","run_summary.json":"처리 시간"};
 const OSMD_URLS=["https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.9.9/build/opensheetmusicdisplay.min.js","https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.8.9/build/opensheetmusicdisplay.min.js"];
 const RFILES={"piano_fixed.mid":"보정 MIDI","piano_fixed.wav":"보정 WAV","piano_arranged.mid":"편곡 MIDI","piano_arranged.wav":"편곡 WAV","refine_report.md":"보정 리포트","refine_report.json":"보정 리포트 JSON"};
 const RSTATE={queued:"보정 대기 중",running:"보정 중…",done:"보정 완료",failed:"보정 실패"};
