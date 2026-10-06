@@ -1,0 +1,325 @@
+diff --git a/PianoForge_MAX_v4.3.py b/PianoForge_MAX_v4.3.py
+index 3521356..046569d 100644
+--- a/PianoForge_MAX_v4.3.py
++++ b/PianoForge_MAX_v4.3.py
+@@ -106,4 +106,5 @@ HOST = os.environ.get("PIANOFORGE_HOST", "127.0.0.1")  # tunnel / Colab proxy /
+ SOUNDFONT = os.environ.get("PIANOFORGE_SOUNDFONT", "/usr/share/sounds/sf2/FluidR3_GM.sf2")
+ MAX_JSON_BYTES = 1 << 20
++VOCAL_ALPHA_DEFAULT = 0.85  # nodrums_vocals: 보컬 스템을 이 배수만큼만 뺀다(1.0이면 피아노-보컬 유니슨까지 지워짐)
+ MAX_UPLOAD_BYTES = 95 * 1024 * 1024  # Cloudflare quick tunnels reject request bodies over 100 MB
+ TUNNEL = os.environ.get("PIANOFORGE_TUNNEL", "cloudflare" if IN_COLAB else "none")
+@@ -204,4 +205,6 @@ OUTPUT_FILES = {
+     "piano_theory.mid": "audio/midi", "piano_theory.wav": "audio/wav", "piano_theory_preview.mp3": "audio/mpeg",
+     "theory_refine_report.json": "application/json",
++    "piano_novocal.mid": "audio/midi", "piano_novocal.wav": "audio/wav", "piano_novocal_preview.mp3": "audio/mpeg",
++    "vocal_suppress_report.json": "application/json",
+ }
+ REFINE_OUTPUTS = ("piano_fixed.mid", "piano_fixed.wav", "piano_arranged.mid", "piano_arranged.wav",
+@@ -2077,4 +2080,138 @@ KEYWORD_ROLE.update({k: "해당 없음: " + why for k, why in _NO_EFFECT.items()
+ 
+ 
++# =========================================================================== 보컬 오채보 억제 / 소스 추천 (v4.3)
++# 보컬이 남은 소스(nodrums 등)에서는 보컬 선율이 피아노 음으로 채보된다. 보컬 스템에 같은 시각·같은 음이 있고
++# 반주(other) 스템에는 없는 음은 "보컬 유령음"으로 보고 벨로시티만 낮춘다(삭제하지 않음: 진짜 유니슨을 살리기 위함).
++
++
++def onset_tolerance_s(beat_s: float) -> float:
++    """박 길이의 1/8, 단 0.04~0.10초 안에서만 움직인다(느린 곡은 어택이 퍼지고 빠른 곡은 겹치기 쉬움)."""
++    return min(0.10, max(0.04, beat_s / 8.0))
++
++
++def suppress_vocal_ghosts(piano_notes, vocal_notes, other_notes, beat_s=0.5, alpha=0.3):
++    """(감쇠된 음 목록, 통계). (a) vocal_notes에 같은 onset(±tol)·같은 음(옥타브 ±12, ±24 허용)이 있고
++    (b) other_notes에는 그 음(같은 onset·같은 음높이)이 없으면 보컬 유령음 → 벨로시티 × alpha. 음 자체는 그대로 둔다."""
++    import bisect
++
++    tol = onset_tolerance_s(beat_s)
++
++    def index(notes):
++        by: dict[int, list[float]] = {}
++        for n in notes:
++            by.setdefault(n.pitch, []).append(n.onset_s)
++        for v in by.values():
++            v.sort()
++        return by
++
++    def has(by, pitch, t):
++        v = by.get(pitch)
++        if not v:
++            return False
++        i = bisect.bisect_left(v, t - tol)
++        return i < len(v) and v[i] <= t + tol
++
++    voc, oth = index(vocal_notes or ()), index(other_notes or ())
++    out: list[TNote] = []
++    flagged: list[int] = []
++    ghosts = octave = 0
++    for i, pn in enumerate(piano_notes):
++        in_vocal = any(has(voc, pn.pitch + d, pn.onset_s) for d in (0, 12, -12, 24, -24))
++        if in_vocal and not has(oth, pn.pitch, pn.onset_s):
++            ghosts += 1
++            flagged.append(i)
++            octave += 0 if has(voc, pn.pitch, pn.onset_s) else 1
++            out.append(TNote(pn.onset_s, pn.offset_s, pn.pitch, max(1, int(round(pn.velocity * alpha)))))
++        else:
++            out.append(TNote(pn.onset_s, pn.offset_s, pn.pitch, pn.velocity))
++    total = len(out)
++    return out, {"total": total, "vocal_ghosts": ghosts, "kept": total - ghosts, "octave_ghosts": octave, "ghost_index": flagged,
++                 "alpha": alpha, "onset_tol_s": round(tol, 4), "vocal_notes": len(vocal_notes or ()), "other_notes": len(other_notes or ())}
++
++
++def stem_notes_from_cqt(db, fps, top_k=1, floor_db=-10.0, frame_gate=None, min_len_s=0.06, bridge_s=0.04):
++    """88건반 상대 CQT(dB, 프레임별 최대 0)에서 '이 시각에 이 음이 울린다'는 증거용 음 목록을 만든다.
++    전사 모델이 아니라 봉우리 추적이다: 프레임마다 음높이 방향 극대점 중 상위 top_k개를 잇는다(numpy만 사용).
++    frame_gate: 프레임별 bool(소리가 있는 프레임만 허용) — 무음 프레임의 상대 dB 잡음을 막는다."""
++    import numpy as np
++
++    db = np.asarray(db)
++    nb, nt = db.shape
++    pad = np.pad(db, ((1, 1), (0, 0)), constant_values=-200.0)
++    peak = (db >= pad[:-2]) & (db > pad[2:]) & (db >= floor_db)
++    if top_k and top_k < nb:
++        thr = -np.sort(-np.where(peak, db, -200.0), axis=0)[top_k - 1]
++        peak &= db >= thr[None, :]
++    if frame_gate is not None:
++        peak &= np.asarray(frame_gate, dtype=bool)[None, :nt]
++    bridge, min_len = max(1, int(round(bridge_s * fps))), max(1, int(round(min_len_s * fps)))
++    notes = []
++    for k in range(nb):
++        row = np.concatenate(([False], peak[k], [False]))
++        edges = np.flatnonzero(row[1:] != row[:-1])
++        runs = [(int(a), int(b)) for a, b in zip(edges[0::2], edges[1::2])]
++        merged: list[list[int]] = []
++        for a, b in runs:
++            if merged and a - merged[-1][1] <= bridge:
++                merged[-1][1] = b
++            else:
++                merged.append([a, b])
++        for a, b in merged:
++            if b - a >= min_len:
++                notes.append(TNote(a / fps, b / fps, 21 + k, 64))
++    return sorted(notes, key=lambda n: (n.onset_s, n.pitch))
++
++
++def stem_rms_db(path) -> float:
++    """스템 파일의 RMS(dBFS). 블록 단위로 읽어 메모리를 아낀다."""
++    import soundfile as sf
++
++    tot, cnt = 0.0, 0
++    with sf.SoundFile(str(path)) as fh:
++        for blk in fh.blocks(blocksize=1 << 18, dtype="float32", always_2d=True):
++            tot += float((blk.astype("float64") ** 2).sum())
++            cnt += blk.size
++    return 10.0 * _math.log10(tot / cnt + 1e-20) if cnt else -120.0
++
++
++def recommend_piano_source(stem_energies: dict) -> dict:
++    """스템 RMS(dBFS) → 추천 piano_source. 비율은 mix 대비 '전력' 비율(보컬/mix > 0.25 이면 보컬이 큼).
++    stem_energies: {"vocals": dB, "drums": dB, "bass": dB, "other": dB, ["piano": dB,] ["mix": dB]}"""
++    stems = {k: v for k, v in stem_energies.items() if k != "mix" and v is not None}
++    if len(stems) < 2:
++        return {"source": "mix", "reason": "스템 정보가 부족해 분리 없이 원곡 전체를 권장합니다", "ratios": {}}
++    mix_db = stem_energies.get("mix")
++    if mix_db is None:
++        mix_db = 10.0 * _math.log10(sum(10 ** (v / 10.0) for v in stems.values()))
++    ratios = {k: 10 ** ((v - mix_db) / 10.0) for k, v in stems.items()}
++    r = lambda k: ratios.get(k, 0.0)
++    if "piano" in ratios and r("piano") > 0.40 and r("piano") >= r("vocals"):
++        src, why = "piano", f"피아노 스템이 지배적입니다(mix 대비 {r('piano'):.0%}) → 6스템 피아노 스템"
++    elif r("vocals") > 0.25:
++        src, why = "nodrums_vocals", f"보컬 비율이 큽니다(mix 대비 {r('vocals'):.1%}, 기준 25% 초과) → 원곡 − 드럼 − 보컬"
++    elif r("vocals") < 0.05 and r("bass") < 0.05 and r("drums") < 0.05 and r("other") > 0.5:
++        src, why = "other", f"반주 스템이 거의 전부입니다(other {r('other'):.0%}) → 반주 스템만"
++    elif r("drums") > 0.5:
++        src, why = "nodrums", f"드럼이 강합니다(drums {r('drums'):.0%}) → 원곡 − 드럼"
++    else:
++        src, why = "nodrums", f"보컬 비율 {r('vocals'):.0%}(≤ 25%) → 기본값 원곡 − 드럼"
++    return {"source": src, "reason": why, "ratios": {k: round(v, 3) for k, v in ratios.items()}}
++
++
++def mix_vocal_residual(piano_path, vocal_path, alpha, read_audio, write_wav):
++    """piano_source.wav(= 원곡 − 드럼)에서 보컬 스템 × alpha 를 더 뺀다(같은 파일에 원자적으로 덮어씀). 반환: (오디오, sr)."""
++    piano, sr = read_audio(piano_path)
++    voc, vsr = read_audio(vocal_path)
++    if vsr != sr or voc.shape[1] != piano.shape[1]:
++        n = min(voc.shape[1], piano.shape[1])
++        voc, piano = voc[:, :n], piano[:, :n]
++    ch = min(voc.shape[0], piano.shape[0])
++    out = piano.copy()
++    out[:ch] = piano[:ch] - alpha * voc[:ch]
++    write_wav(piano_path, out, sr, subtype="FLOAT")
++    return out, sr
++
++
++
+ def write_theory_midi(src: Path, dest: Path, notes: list) -> None:
+     """piano.mid with its notes replaced (tempo map, pedal CC and everything else is kept)."""
+@@ -2119,4 +2256,5 @@ class Job:
+     cancel_requested: bool = False
+     intermediates_cleared: bool = False      # big intermediate files were deleted: refinement is unavailable
++    source_hint: dict[str, Any] = field(default_factory=dict)  # 분리 직후 스템 에너지로 계산한 piano_source 추천
+ 
+     @property
+@@ -2181,4 +2319,15 @@ class App:
+             # Both names mean the same thing in the UI/API: original mix minus drums.
+             upd.update({"separation.piano_source": "residual", "separation.model": "htdemucs_ft"})
++        elif src == "nodrums_vocals":
++            # 원곡 − 드럼 − α·보컬. α는 "vocals@α" 표식으로 residual_subtract(=분리 캐시 키)에 실어 보낸다
++            # (α가 다르면 다른 캐시 항목이 되고, 번들은 표식을 모르므로 _stage_separate()가 대신 처리한다).
++            try:
++                alpha = float(options.get("vocal_alpha", VOCAL_ALPHA_DEFAULT))
++            except (TypeError, ValueError):
++                raise self.pl.ConfigError(f"vocal_alpha must be a number, got {options.get('vocal_alpha')!r}") from None
++            if not 0.0 < alpha <= 1.0:
++                raise self.pl.ConfigError(f"vocal_alpha must be in (0, 1], got {alpha}")
++            upd.update({"separation.piano_source": "residual", "separation.model": "htdemucs_ft",
++                        "separation.residual_subtract": ["drums", f"vocals@{alpha:g}"]})
+         elif src == "other":
+             upd["separation.piano_source"] = "other"
+@@ -2248,4 +2397,7 @@ class App:
+                     "transcription.octave_relocate": True, "transcription.noise_filter": True,
+                     "postprocess.snap.strength": 0.34, "postprocess.snap.max_shift_s": 0.024})
++        if src == "nodrums_vocals":  # 보컬 스템을 따로 전사하면 보컬 선율이 표결로 다시 살아 들어오므로 뺀다(패스 하나 절약)
++            upd["transcription.extra_sources"] = [x for x in upd.get("transcription.extra_sources", []) if x != "vocals"]
++            upd["transcription.second_model_sources"] = [x for x in upd.get("transcription.second_model_sources", ["piano_source"]) if x != "vocals"]
+         if self.device == "cuda" and options.get("device", "auto") in ("auto", "cuda"):
+             upd["transcription.batch_size"] = _cuda_batch_size()
+@@ -2376,4 +2528,104 @@ class App:
+         job.save()
+ 
++    def _stage_separate(self, upstream: Any, out_dir: Path, cfg: Any, ctx: Any) -> Any:
++        """separate 단계 래퍼. residual_subtract에 'vocals@α' 표식이 없으면 번들의 단계를 그대로 실행한다(기존 소스 회귀 없음).
++        있으면 '원곡 − 드럼'으로 분리를 마친 뒤 piano_source.wav에서 보컬 × α 를 더 뺀다."""
++        base_fn = self.pl.DEFAULT_STAGE_FNS["separate"]
++        subtract = tuple(cfg.separation.residual_subtract)
++        tagged = [x for x in subtract if "@" in x]
++        if not tagged:
++            return base_fn(upstream, out_dir, cfg, ctx)
++        name, _, a = tagged[0].partition("@")
++        alpha = float(a)
++        base = tuple(x for x in subtract if "@" not in x)
++        cfg2 = cfg.model_copy(update={"separation": cfg.separation.model_copy(update={"residual_subtract": base})})
++        res = base_fn(upstream, out_dir, cfg2, ctx)
++        voc = res.stems.get(name)
++        if voc is None:  # save_all_stems가 꺼졌거나 모델에 보컬 스템이 없음: 드럼만 뺀 결과를 그대로 쓴다
++            event_log("separate_vocal_subtract_skipped", reason="no vocals stem")
++            return replace(res, warnings=res.warnings + (f"'{name}' 스템이 없어 보컬 감산을 건너뜀",))
++        out, _ = mix_vocal_residual(res.piano_stem_path, voc, alpha, self.pl.read_audio, self.rd.write_wav_atomic)
++        db = getattr(self.pl, "_dbfs", None)
++        return replace(res, piano_source=f"residual(mix - {' - '.join(base)} - {alpha:g}*{name})",
++                       piano_stem_rms_dbfs=db(out) if db else res.piano_stem_rms_dbfs)
++
++    def _stem_dirs(self, summary: Any) -> dict[str, Path]:
++        return {r.name: Path(r.stage_dir) for r in summary.stages}
++
++    def _recommend_source(self, job: Job, summary: Any) -> None:
++        """분리 결과의 스템 에너지로 piano_source를 추천해 job.source_hint 에 기록한다(GET /api/jobs/<id> 로 노출).
++        실패해도 변환은 계속된다."""
++        try:
++            _, sep = self.pl.read_manifest(self._stem_dirs(summary)["separate"], stage="separate")
++            db = {n: stem_rms_db(p) for n, p in sep.stems.items() if Path(p).is_file()}
++            if sep.mix_rms_dbfs is not None:
++                db["mix"] = float(sep.mix_rms_dbfs)
++            rec = recommend_piano_source(db)
++            job.source_hint = {**rec, "current": job.options.get("piano_source", "nodrums"),
++                               "stem_dbfs": {k: round(v, 1) for k, v in db.items()}}
++        except Exception:
++            event_log("source_hint_failed", job=job.id, traceback=traceback.format_exc())
++
++    def _stem_evidence(self, path: Path, top_k: int, floor_db: float) -> list:
++        """스템 한 개 → 증거용 음 목록(16 kHz 모노 CQT 봉우리 추적). librosa가 없으면 []."""
++        import numpy as np
++
++        audio, sr = self.pl.read_audio(path)
++        mono = self.pl.resample_audio(audio.mean(0, keepdims=True), sr, 16000)[0]
++        res = self.tr.relative_cqt_db(mono, 16000)
++        if res is None:
++            return []
++        db, fps = res
++        hop = int(round(16000 / fps))
++        frames = db.shape[1]
++        pad = np.pad(mono.astype("float32") ** 2, (0, max(0, frames * hop - mono.size)))[:frames * hop]
++        lvl = 10.0 * np.log10(pad.reshape(frames, hop).mean(1) + 1e-12)
++        return stem_notes_from_cqt(db, fps, top_k=top_k, floor_db=floor_db, frame_gate=lvl > (lvl.max() - 35.0))
++
++    def _write_novocal(self, job: Job, summary: Any) -> None:
++        """piano_novocal.mid: piano.mid에서 '보컬 유령음'의 벨로시티만 낮춘 사본(원본 piano.mid는 그대로).
++        options.novocal=False 로 끌 수 있다. 실패해도 변환은 계속된다."""
++        if not job.options.get("novocal", True):
++            return
++        try:
++            t0 = time.time()
++            _, sep = self.pl.read_manifest(self._stem_dirs(summary)["separate"], stage="separate")
++            voc_p, oth_p = sep.stems.get("vocals"), sep.stems.get("other")
++            if voc_p is None or oth_p is None or not Path(voc_p).is_file() or not Path(oth_p).is_file():
++                event_log("novocal_skipped", job=job.id, reason="vocals/other 스템 없음")
++                return
++            notes, _ = self.tr.read_midi(job.out / "piano.mid")
++            piano = [TNote(n.onset_s, n.offset_s, n.pitch, n.velocity) for n in notes]
++            vocal = self._stem_evidence(Path(voc_p), top_k=1, floor_db=-8.0)
++            other = self._stem_evidence(Path(oth_p), top_k=6, floor_db=-14.0)
++            alpha = float(job.options.get("novocal_alpha", 0.3))
++            beat = estimate_beat(piano) if len(piano) >= 8 else 0.5
++            new, info = suppress_vocal_ghosts(piano, vocal, other, beat_s=beat, alpha=alpha)
++            flagged = set(info.pop("ghost_index"))
++            info.update({"options": {"piano_source": job.options.get("piano_source", "nodrums"), "novocal_alpha": alpha,
++                                     "vocal_alpha": job.options.get("vocal_alpha", VOCAL_ALPHA_DEFAULT)},
++                         "source_label": getattr(sep, "piano_source", None), "beat_s": round(beat, 3)})
++            write_theory_midi(job.out / "piano.mid", job.out / "piano_novocal.mid", new)
++            try:
++                cfg = self.config_for(job.options)
++                self.rd.render_midi(job.out / "piano_novocal.mid", job.out / "piano_novocal.wav",
++                                    self.pl.render_params(cfg.render, cfg.postprocess.pedal))
++                make_preview(job.out / "piano_novocal.wav")
++            except Exception as exc:  # MIDI가 산출물이다: 렌더 실패는 WAV만 잃는다
++                info["render_error"] = f"{type(exc).__name__}: {exc}"
++            if job.reference:
++                ref, _ = self.tr.read_midi(Path(job.reference))
++                refn = [TNote(n.onset_s, n.offset_s, n.pitch, n.velocity) for n in ref]
++                kept = [n for i, n in enumerate(piano) if i not in flagged]
++                before, after = note_f1(piano, refn), note_f1(kept, refn)
++                info.update({"f1_piano_mid": before, "f1_piano_novocal_mid": after,
++                             "recall_drop_pp": round((before[1] - after[1]) * 100, 2),
++                             "recall_ok": (before[1] - after[1]) * 100 <= 5.0,
++                             "f1_note": "(정밀도, 재현율, F1). novocal 쪽은 감쇠된 음(보컬 유령음)을 제외하고 계산 — 벨로시티만 바꾸면 onset 기반 F1은 변하지 않기 때문"})
++            info["elapsed_s"] = round(time.time() - t0, 1)
++            (job.out / "vocal_suppress_report.json").write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
++        except Exception:
++            event_log("novocal_failed", job=job.id, traceback=traceback.format_exc())
++
+     def _write_keywords(self, job: Job) -> None:
+         """keywords_report.md/json: which of the requested music keywords the converted MIDI really shows.
+@@ -2455,4 +2707,5 @@ class App:
+ 
+         fns = {n: wrap(n, f) for n, f in pl.DEFAULT_STAGE_FNS.items()}
++        fns["separate"] = wrap("separate", self._stage_separate)  # 'vocals@α' 표식이 없으면 기존 단계 그대로
+         fns["transcribe"] = wrap("transcribe", pl.make_stage_transcribe(lambda cfg, dev: self._progress_backend(job, cfg, dev)))
+         try:
+@@ -2473,6 +2726,8 @@ class App:
+                 use_cache=not job.options.get("no_cache", False))
+             make_preview(job.out / "piano.wav")
++            self._recommend_source(job, summary)
+             self._write_keywords(job)
+             self._write_theory(job)
++            self._write_novocal(job, summary)
+             job.state, job.stage, job.intermediates_cleared = "done", None, False
+             job.summary = list(summary.evaluation.get("summary", ()))
+@@ -3437,4 +3692,5 @@ table.store td{padding:2px 14px 2px 0}
+       <select id="src">
+         <option value="nodrums">원곡 − 드럼 (선율·베이스 포함, 권장)</option>
++        <option value="nodrums_vocals">원곡 − 드럼 − 보컬 (보컬 있는 대중가요)</option>
+         <option value="other">반주 스템만 (보컬·드럼·베이스 제외)</option>
+         <option value="residual">원곡 − 보컬·드럼·베이스 (잔여 신호)</option>
+@@ -3517,5 +3773,5 @@ const PRESETS={
+ };
+ const VOLATILE=["elapsed_s","stage_elapsed_s","eta_s","progress","progress_label","queue_position"];
+-const FILES={"piano.mid":"MIDI","piano.musicxml":"악보 (MusicXML)","prompt.txt":"AI 음악 프롬프트","piano.wav":"WAV","report.md":"리포트","keywords_report.md":"키워드 검출 리포트","piano_theory.mid":"이론 보정 MIDI","piano_theory.wav":"이론 보정 WAV","theory_refine_report.json":"이론 보정 리포트","keywords_report.json":"키워드 JSON","report.json":"리포트 JSON","run_summary.json":"처리 시간"};
++const FILES={"piano.mid":"MIDI","piano_novocal.mid":"보컬 억제 MIDI","piano_novocal.wav":"보컬 억제 WAV","vocal_suppress_report.json":"보컬 억제 리포트","piano.musicxml":"악보 (MusicXML)","prompt.txt":"AI 음악 프롬프트","piano.wav":"WAV","report.md":"리포트","keywords_report.md":"키워드 검출 리포트","piano_theory.mid":"이론 보정 MIDI","piano_theory.wav":"이론 보정 WAV","theory_refine_report.json":"이론 보정 리포트","keywords_report.json":"키워드 JSON","report.json":"리포트 JSON","run_summary.json":"처리 시간"};
+ const OSMD_URLS=["https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.9.9/build/opensheetmusicdisplay.min.js","https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.8.9/build/opensheetmusicdisplay.min.js"];
+ const RFILES={"piano_fixed.mid":"보정 MIDI","piano_fixed.wav":"보정 WAV","piano_arranged.mid":"편곡 MIDI","piano_arranged.wav":"편곡 WAV","refine_report.md":"보정 리포트","refine_report.json":"보정 리포트 JSON"};
+@@ -3651,4 +3907,5 @@ function card(job){
+     ${job.error?`<div class="err">${esc(job.error)}${job.exit_code&&job.state==="failed"?` (종료 코드 ${job.exit_code})`:""}</div>`:""}
+     ${hint?`<div class="tip">${esc(hint)}</div>`:""}
++    ${job.source_hint&&job.source_hint.source&&job.source_hint.source!==job.source_hint.current?`<div class="tip">소스 추천: ${esc(job.source_hint.reason)} (지금: ${esc(job.source_hint.current)})</div>`:""}
+     ${f.includes("piano.wav")||f.includes("piano_preview.mp3")?abPlayer(job):""}
+     ${links?`<div class="files">${links}</div>`:""}
