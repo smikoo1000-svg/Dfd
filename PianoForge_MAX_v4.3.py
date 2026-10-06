@@ -201,6 +201,8 @@ OUTPUT_FILES = {
     "piano_arranged_preview.mp3": "audio/mpeg", "original_preview.mp3": "audio/mpeg",
     "piano.musicxml": "application/vnd.recordare.musicxml+xml", "prompt.txt": "text/plain; charset=utf-8",
     "keywords_report.md": "text/markdown; charset=utf-8", "keywords_report.json": "application/json",
+    "piano_theory.mid": "audio/midi", "piano_theory.wav": "audio/wav", "piano_theory_preview.mp3": "audio/mpeg",
+    "theory_refine_report.json": "application/json",
 }
 REFINE_OUTPUTS = ("piano_fixed.mid", "piano_fixed.wav", "piano_arranged.mid", "piano_arranged.wav",
                   "refine_report.md", "refine_report.json", "piano_fixed_preview.mp3", "piano_arranged_preview.mp3")
@@ -1811,6 +1813,156 @@ KEYWORD_LIST: tuple[str, ...] = (
 )
 
 
+
+# =========================================================================== theory-guided refinement (v4.3)
+# Uses the keyword analysis above as evidence to clean the transcription: the key, chords and repeated
+# patterns tell which detections are probably ghosts and which expected notes were missed. It is
+# deliberately conservative: a note is removed only when several independent signals agree, and notes are
+# added only when a pattern repeats in at least two other places. The result is written as piano_theory.mid
+# NEXT TO piano.mid: the original is never overwritten, and with a reference MIDI both are scored.
+from dataclasses import dataclass as _dc
+
+
+@_dc(frozen=True)
+class TNote:
+    onset_s: float
+    offset_s: float
+    pitch: int
+    velocity: int
+
+
+def note_f1(est, ref, tol=0.05):
+    """(precision, recall, F1) of note onsets: same pitch and onset within tol seconds (greedy 1:1)."""
+    by_pitch: dict[int, list[float]] = {}
+    for n in ref:
+        by_pitch.setdefault(n.pitch, []).append(n.onset_s)
+    for v in by_pitch.values():
+        v.sort()
+    used: dict[int, set[int]] = {}
+    tp = 0
+    for n in sorted(est, key=lambda x: x.onset_s):
+        cand = by_pitch.get(n.pitch, [])
+        u = used.setdefault(n.pitch, set())
+        best, bd = None, tol + 1e-9
+        for i, t in enumerate(cand):
+            if i not in u and abs(t - n.onset_s) < bd:
+                best, bd = i, abs(t - n.onset_s)
+        if best is not None:
+            u.add(best)
+            tp += 1
+    p = tp / len(est) if est else 0.0
+    r = tp / len(ref) if ref else 0.0
+    return round(p, 4), round(r, 4), round(2 * p * r / (p + r), 4) if p + r else 0.0
+
+
+def _diatonic(tonic, mode):
+    iv = (0, 2, 4, 5, 7, 9, 11) if mode == "major" else (0, 2, 3, 5, 7, 8, 9, 10, 11)  # minor: natural + raised 6th/7th
+    return {(tonic + i) % 12 for i in iv}
+
+
+def theory_refine(notes, *, beat_s=None, bars=None):
+    """Returns (new_notes, info). info = {removed: [...], added: [...], reasons: {...}}."""
+    notes = sorted(notes, key=lambda n: (n.onset_s, n.pitch))
+    if len(notes) < 40:
+        return list(notes), {"removed": [], "added": [], "reasons": {}, "skipped": "음표가 너무 적어 보정하지 않음"}
+    beat = beat_s or estimate_beat(notes)
+    end = max(n.offset_s for n in notes)
+    med_vel = _med([n.velocity for n in notes])
+    # local keys (window ~ 8 beats*2); a window without a clear key gets no key-based removal at all
+    win = max(6.0, beat * 16)
+    seg_keys = []
+    t = 0.0
+    while t < end:
+        w = [n for n in notes if t <= n.onset_s < t + win]
+        k = estimate_key(w) if len(w) >= 16 else None
+        seg_keys.append((t, t + win, k if k and k[2] >= 0.7 else None))
+        t += win
+    def key_at(x):
+        for a, b, k in seg_keys:
+            if a <= x < b:
+                return k
+        return None
+    chords = chord_track(notes, beat, 0)
+    ctimes = [c["t"] for c in chords]
+    import bisect
+    def chord_pcs_at(x):
+        if not chords:
+            return None
+        i = bisect.bisect_right(ctimes, x) - 1
+        if i < 0 or x - ctimes[i] > beat * 4:
+            return None
+        c = chords[i]
+        return {(c["root"] + j) % 12 for j in _CHORDS[c["kind"]]}
+    pitch_count: dict[int, int] = {}
+    for n in notes:
+        pitch_count[n.pitch] = pitch_count.get(n.pitch, 0) + 1
+    removed: list[int] = []
+    reasons: dict[str, int] = {"조성 밖 약한 고립음": 0, "옥타브 유령음": 0}
+    for i, n in enumerate(notes):
+        dur = n.offset_s - n.onset_s
+        weak = dur < 0.09 or n.velocity < med_vel - 22
+        k = key_at(n.onset_s)
+        if weak and k and (n.pitch - k[0]) % 12 not in _diatonic(k[0], k[1]):
+            cp = chord_pcs_at(n.onset_s)
+            prev_n = [m for m in notes[max(0, i - 6):i] if abs(m.onset_s - n.onset_s) < 0.5 and m is not n]
+            nxt_n = [m for m in notes[i + 1:i + 7] if abs(m.onset_s - n.onset_s) < 0.5]
+            stepwise = any(abs(m.pitch - n.pitch) <= 1 for m in prev_n) and any(abs(m.pitch - n.pitch) <= 2 for m in nxt_n)
+            if (cp is None or n.pitch % 12 not in cp) and pitch_count[n.pitch] <= 2 and not stepwise:
+                removed.append(i)
+                reasons["조성 밖 약한 고립음"] += 1
+                continue
+        for m in notes[max(0, i - 8):i + 9]:
+            if m is not n and abs(m.onset_s - n.onset_s) < 0.03 and (m.pitch - n.pitch) in (12, -12, 19, -19, 24, -24) \
+                    and n.velocity < 0.55 * m.velocity and dur <= (m.offset_s - m.onset_s) * 1.1:
+                removed.append(i)
+                reasons["옥타브 유령음"] += 1
+                break
+    rm = set(removed)
+    kept = [n for i, n in enumerate(notes) if i not in rm]
+    # ---- fill one missing note in a bar whose neighbours (>=2 bars) repeat the same pattern with that note
+    added: list[TNote] = []
+    if bars and len(bars) > 6:
+        tol = 0.045
+        def contains(sig, item):
+            return any(p == item[1] and abs(ph - item[0]) <= tol for ph, p, _ in sig)
+        for lo_band in (True, False):  # left-hand and right-hand registers repeat their patterns independently
+            sigs = [[(n.onset_s - a, n.pitch, n) for n in kept if a <= n.onset_s < b and (n.pitch < 60) == lo_band]
+                    for a, b in zip(bars, bars[1:])]
+            for i, sig in enumerate(sigs):
+                if len(sig) < 4:
+                    continue
+                votes: dict[tuple[int, int], list] = {}
+                for j in range(max(0, i - 8), min(len(sigs), i + 9)):
+                    if j == i or len(sigs[j]) < 6 or len(sigs[j]) - len(sig) != 1:
+                        continue
+                    if all(contains(sigs[j], (ph, p)) for ph, p, _ in sig):
+                        miss = [(ph, p, nn) for ph, p, nn in sigs[j] if not contains(sig, (ph, p))]
+                        if len(miss) == 1:
+                            ph, p, nn = miss[0]
+                            votes.setdefault((round(ph / tol), p), []).append((ph, nn))
+                for (_, p), vs in votes.items():
+                    if len(vs) >= 3:
+                        ph = _med([v[0] for v in vs])
+                        src = vs[0][1]
+                        added.append(TNote(round(bars[i] + ph, 4), round(bars[i] + ph + (src.offset_s - src.onset_s), 4), p,
+                                           int(_med([v[1].velocity for v in vs]))))
+    out = sorted(kept + added, key=lambda n: (n.onset_s, n.pitch))
+    return out, {"removed": [(round(notes[i].onset_s, 3), notes[i].pitch) for i in removed],
+                 "added": [(a.onset_s, a.pitch) for a in added], "reasons": reasons, "notes_in": len(notes), "notes_out": len(out)}
+
+
+def write_theory_midi(src: Path, dest: Path, notes: list) -> None:
+    """piano.mid with its notes replaced (tempo map, pedal CC and everything else is kept)."""
+    import pretty_midi
+
+    pm = pretty_midi.PrettyMIDI(str(src))
+    inst = next(i for i in pm.instruments if not i.is_drum)
+    inst.notes = [pretty_midi.Note(velocity=int(n.velocity), pitch=int(n.pitch), start=float(n.onset_s), end=float(n.offset_s)) for n in notes]
+    tmp = dest.with_name(dest.name + ".part")
+    pm.write(str(tmp))
+    tmp.replace(dest)
+
+
 _SAVE_LOCK = threading.Lock()
 
 
@@ -2110,6 +2262,36 @@ class App:
         except Exception:
             event_log("keywords_failed", job=job.id, traceback=traceback.format_exc())
 
+    def _write_theory(self, job: Job) -> None:
+        """piano_theory.mid: piano.mid minus probable ghost notes plus pattern-confirmed missing notes
+        (see theory_refine). piano.mid itself is untouched. With a reference MIDI both versions are scored
+        so the user sees whether it really helped for this song."""
+        try:
+            notes, _ = self.tr.read_midi(job.out / "piano.mid")
+            bars = self.roll(job).get("bars") or None
+            new, info = theory_refine([TNote(n.onset_s, n.offset_s, n.pitch, n.velocity) for n in notes], bars=bars)
+            if "skipped" in info:
+                info["written"] = False
+            else:
+                write_theory_midi(job.out / "piano.mid", job.out / "piano_theory.mid", new)
+                info["written"] = True
+                try:
+                    cfg = self.config_for(job.options)
+                    self.rd.render_midi(job.out / "piano_theory.mid", job.out / "piano_theory.wav",
+                                        self.pl.render_params(cfg.render, cfg.postprocess.pedal))
+                    make_preview(job.out / "piano_theory.wav")
+                except Exception as exc:  # the MIDI is the product; a failed render only costs the WAV
+                    info["render_error"] = f"{type(exc).__name__}: {exc}"
+            if job.reference:
+                ref, _ = self.tr.read_midi(Path(job.reference))
+                refn = [TNote(n.onset_s, n.offset_s, n.pitch, n.velocity) for n in ref]
+                info["f1_piano_mid"] = note_f1([TNote(n.onset_s, n.offset_s, n.pitch, n.velocity) for n in notes], refn)
+                info["f1_piano_theory_mid"] = note_f1(new, refn)
+                info["f1_note"] = "(정밀도, 재현율, F1) — 음높이 일치 + 시작 시각 ±50ms"
+            (job.out / "theory_refine_report.json").write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
+        except Exception:
+            event_log("theory_refine_failed", job=job.id, traceback=traceback.format_exc())
+
     def pl_device(self, job: Job) -> str:
         return self.tr.resolve_device(job.options.get("device", "auto"))
 
@@ -2165,6 +2347,7 @@ class App:
                 use_cache=not job.options.get("no_cache", False))
             make_preview(job.out / "piano.wav")
             self._write_keywords(job)
+            self._write_theory(job)
             job.state, job.stage, job.intermediates_cleared = "done", None, False
             job.summary = list(summary.evaluation.get("summary", ()))
             job.duration_s = job.duration_s or float(summary.audio_duration_s)
@@ -3207,7 +3390,7 @@ const PRESETS={
   fidelity:{quality:"max",notes:"max",room:"hall",piano:"auto",piano_source:"nodrums",pedal:true,snap:true,piano_type:"grand",texture:"clean",mech:"none"}
 };
 const VOLATILE=["elapsed_s","stage_elapsed_s","eta_s","progress","progress_label","queue_position"];
-const FILES={"piano.mid":"MIDI","piano.musicxml":"악보 (MusicXML)","prompt.txt":"AI 음악 프롬프트","piano.wav":"WAV","report.md":"리포트","keywords_report.md":"키워드 검출 리포트","keywords_report.json":"키워드 JSON","report.json":"리포트 JSON","run_summary.json":"처리 시간"};
+const FILES={"piano.mid":"MIDI","piano.musicxml":"악보 (MusicXML)","prompt.txt":"AI 음악 프롬프트","piano.wav":"WAV","report.md":"리포트","keywords_report.md":"키워드 검출 리포트","piano_theory.mid":"이론 보정 MIDI","piano_theory.wav":"이론 보정 WAV","theory_refine_report.json":"이론 보정 리포트","keywords_report.json":"키워드 JSON","report.json":"리포트 JSON","run_summary.json":"처리 시간"};
 const OSMD_URLS=["https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.9.9/build/opensheetmusicdisplay.min.js","https://cdn.jsdelivr.net/npm/opensheetmusicdisplay@1.8.9/build/opensheetmusicdisplay.min.js"];
 const RFILES={"piano_fixed.mid":"보정 MIDI","piano_fixed.wav":"보정 WAV","piano_arranged.mid":"편곡 MIDI","piano_arranged.wav":"편곡 WAV","refine_report.md":"보정 리포트","refine_report.json":"보정 리포트 JSON"};
 const RSTATE={queued:"보정 대기 중",running:"보정 중…",done:"보정 완료",failed:"보정 실패"};
