@@ -1860,6 +1860,71 @@ def _diatonic(tonic, mode):
     return {(tonic + i) % 12 for i in iv}
 
 
+def _protected(notes, beat, key_at):
+    """Indices of notes that look odd (short, off-key, weak, stacked) but belong to a recognised figure; the
+    removal rules never touch them."""
+    idx = {id(n): i for i, n in enumerate(notes)}
+    prot: set[int] = set()
+    cl = _clusters(notes)
+    top = [c[-1] for c in cl]
+    for a in range(len(top)):  # fast figures on the top line: trill / tremolo / glissando / repeated notes
+        b = a
+        while b + 1 < len(top) and top[b + 1].onset_s - top[b].onset_s < 0.14:
+            b += 1
+        if b - a + 1 >= 5:
+            prot.update(idx[id(n)] for n in top[a:b + 1])
+    for c in cl:  # clusters (>=3 notes within a whole step each) and rolled chords
+        ps = [n.pitch for n in c]
+        if len(c) >= 3 and all(y - x <= 2 for x, y in zip(ps, ps[1:])):
+            prot.update(idx[id(n)] for n in c)
+    for a, b in zip(notes, notes[1:]):  # grace note before a longer neighbour
+        if a.offset_s - a.onset_s < 0.07 and 0 < b.onset_s - a.onset_s < 0.13 and b.offset_s - b.onset_s >= 3 * (a.offset_s - a.onset_s) and abs(a.pitch - b.pitch) <= 2:
+            prot.add(idx[id(a)])
+    loud = _med([n.velocity for n in notes]) + 18
+    for i, n in enumerate(notes):  # accents / sfz / marcato are meant to stand out
+        if n.velocity >= loud:
+            prot.add(i)
+    return prot
+
+
+def _adjust(notes, protected_keys, beat):
+    """Playability fixes that never change which notes exist: re-struck same pitch must not overlap itself,
+    near-simultaneous chord notes line up (unless it is a rolled chord), absurd velocity outliers are pulled in."""
+    fixed = {"같은 음 겹침 정리": 0, "화음 동시 타건 정렬": 0, "벨로시티 이상치 보정": 0}
+    ns = [TNote(n.onset_s, n.offset_s, n.pitch, n.velocity) for n in notes]
+    last: dict[int, int] = {}
+    for i, n in enumerate(ns):
+        j = last.get(n.pitch)
+        if j is not None and ns[j].offset_s > n.onset_s:
+            p = ns[j]
+            ns[j] = TNote(p.onset_s, max(p.onset_s + 0.02, n.onset_s - 0.005), p.pitch, p.velocity)
+            fixed["같은 음 겹침 정리"] += 1
+        last[n.pitch] = i
+    cl = _clusters(ns, 0.035)
+    pos = {id(n): k for k, n in enumerate(ns)}
+    for c in cl:
+        if len(c) >= 3:
+            ons = sorted(n.onset_s for n in c)
+            spread = ons[-1] - ons[0]
+            ascending = all(y.pitch > x.pitch for x, y in zip(sorted(c, key=lambda n: n.onset_s), sorted(c, key=lambda n: n.onset_s)[1:]))
+            if 0.008 < spread <= 0.035 and not ascending:
+                m = _med(ons)
+                for n in c:
+                    k = pos[id(n)]
+                    dur = n.offset_s - n.onset_s
+                    ns[k] = TNote(round(m, 4), round(m + dur, 4), n.pitch, n.velocity)
+                fixed["화음 동시 타건 정렬"] += 1
+    for i, n in enumerate(ns):
+        nb = [m.velocity for m in ns[max(0, i - 6):i + 7] if m is not n and (m.pitch < 60) == (n.pitch < 60)]
+        if len(nb) >= 6 and (round(n.onset_s, 3), n.pitch) not in protected_keys:
+            med = _med(nb)
+            if abs(n.velocity - med) > 40:
+                v = int(med + (25 if n.velocity > med else -25))
+                ns[i] = TNote(n.onset_s, n.offset_s, n.pitch, max(1, min(127, v)))
+                fixed["벨로시티 이상치 보정"] += 1
+    return sorted(ns, key=lambda n: (n.onset_s, n.pitch)), fixed
+
+
 def theory_refine(notes, *, beat_s=None, bars=None):
     """Returns (new_notes, info). info = {removed: [...], added: [...], reasons: {...}}."""
     notes = sorted(notes, key=lambda n: (n.onset_s, n.pitch))
@@ -1893,13 +1958,21 @@ def theory_refine(notes, *, beat_s=None, bars=None):
             return None
         c = chords[i]
         return {(c["root"] + j) % 12 for j in _CHORDS[c["kind"]]}
+    protected = _protected(notes, beat, key_at)
     pitch_count: dict[int, int] = {}
     for n in notes:
         pitch_count[n.pitch] = pitch_count.get(n.pitch, 0) + 1
     removed: list[int] = []
     reasons: dict[str, int] = {"조성 밖 약한 고립음": 0, "옥타브 유령음": 0}
+    reasons["88건반 밖"] = 0
     for i, n in enumerate(notes):
         dur = n.offset_s - n.onset_s
+        if not 21 <= n.pitch <= 108:  # no such key on a piano
+            removed.append(i)
+            reasons["88건반 밖"] += 1
+            continue
+        if i in protected:  # trills, tremolo, glissando, grace notes, clusters, rolled chords, blue notes, accents ...
+            continue
         weak = dur < 0.09 or n.velocity < med_vel - 22
         k = key_at(n.onset_s)
         if weak and k and (n.pitch - k[0]) % 12 not in _diatonic(k[0], k[1]):
@@ -1919,6 +1992,7 @@ def theory_refine(notes, *, beat_s=None, bars=None):
                 break
     rm = set(removed)
     kept = [n for i, n in enumerate(notes) if i not in rm]
+    reasons["보호된 음"] = len(protected)
     # ---- fill one missing note in a bar whose neighbours (>=2 bars) repeat the same pattern with that note
     added: list[TNote] = []
     if bars and len(bars) > 6:
@@ -1947,8 +2021,59 @@ def theory_refine(notes, *, beat_s=None, bars=None):
                         added.append(TNote(round(bars[i] + ph, 4), round(bars[i] + ph + (src.offset_s - src.onset_s), 4), p,
                                            int(_med([v[1].velocity for v in vs]))))
     out = sorted(kept + added, key=lambda n: (n.onset_s, n.pitch))
+    out, adj = _adjust(out, protected_keys={(round(notes[i].onset_s, 3), notes[i].pitch) for i in protected}, beat=beat)
+    reasons.update(adj)
     return out, {"removed": [(round(notes[i].onset_s, 3), notes[i].pitch) for i in removed],
                  "added": [(a.onset_s, a.pitch) for a in added], "reasons": reasons, "notes_in": len(notes), "notes_out": len(out)}
+
+
+# What each of the 196 keywords does in the theory refinement. Every keyword has a role; the ones that
+# cannot act on notes say so and why (the table is written into theory_refine_report.json).
+_ROLE_GROUPS: dict[str, tuple[str, ...]] = {
+    "제거 근거: 조성·화음·음계에 맞지 않는 약한 고립음을 가려냄": (
+        "음계(Scale)", "장음계", "단음계", "펜타토닉", "선법(모드)", "기능화성", "으뜸화음(토닉)", "버금딸림화음(서브도미넌트)", "딸림화음(도미넌트)",
+        "화음(코드)", "텐션 코드(9th·11th·13th)", "투파이브원(II-V-I)", "대리화음(트라이톤 서브스티튜션)", "세컨더리 도미넌트", "모달 인터체인지",
+        "증화음(어그먼트)", "감화음(디미니쉬)", "전조(조바꿈)", "협화음", "불협화음", "화성 해결", "종지법", "정격종지", "반종지", "위종지",
+        "88건반", "임시표", "올림표(샵)", "내림표(플랫)", "제자리표(내추럴)", "더블샵", "더블플랫", "반음", "온음", "음정(Interval)", "음높이(Pitch)", "조표"),
+    "보호: 조성 밖이어도 지우지 않음(의도된 음)": (
+        "블루스 스케일", "블루노트", "무조성(Atonality)", "12음기법", "복조성(Bitonality/Polytonality)", "클러스터 화음", "트릴", "트레몰로", "글리산도",
+        "꾸밈음(전타음)", "롤링 코드", "동음 연타", "대도약", "브로큰 옥타브", "옥타브 주법", "더블 노트(3도·6도 주법)", "스포르찬도(sfz)",
+        "포르테피아노(fp)", "악센트", "마르카토", "마르텔라토", "페르마타", "폴리리듬", "헤미올라", "당김음(싱코페이션)", "셋잇단음표"),
+    "채우기 근거: 반복 패턴에서 한 음만 빠진 마디를 복원": (
+        "알베르티 베이스", "스트라이드 주법", "오스티나토", "분산화음(아르페지오)", "워킹 베이스", "부기우기", "컴핑(Comping)", "모티프(동기)",
+        "도돌이표", "마디", "세로줄"),
+    "타이밍: 템포(박 길이)로 화음 구간·창 크기를 정하고 화음·겹침을 정리": (
+        "템포(BPM)", "라르고", "아다지오", "안단테", "모데라토", "알레그로", "프레스토", "박자표", "음표", "온음표", "2분음표", "4분음표", "8분음표",
+        "16분음표", "점음표", "쉼표", "리타르단도", "아첼레란도", "아 템포", "템포 루바토", "붙임줄", "이음줄", "음의 길이(Duration)"),
+    "벨로시티: 구간 이상치만 보정, 의도된 강약은 보호": (
+        "피아니시모(pp)", "피아노(p)", "메조피아노(mp)", "메조포르테(mf)", "포르테(f)", "포르티시모(ff)", "크레셴도", "데크레셴도", "셈여림(Dynamics)",
+        "벨로시티", "칸타빌레", "보이싱(성부 분리)", "텍스처(짜임새)"),
+    "음길이: 같은 음 겹침 정리, 아티큘레이션은 유지": (
+        "레가토", "레가티시모", "스타카토", "스타카티시모", "포르타토", "테누토", "논 레가토", "아티큘레이션", "동시발음수(보이스 폴리포니)"),
+    "참고용: 리포트에는 쓰이지만 보정 규칙을 바꾸지는 않음": (
+        "프레이즈(악구)", "프레이징", "2부 형식", "3부 형식", "론도 형식", "변주곡", "소나타 형식", "제시부", "전개부(발전부)", "재현부",
+        "모노포니(단성음악)", "호모포니", "폴리포니(대위법)", "소나타", "녹턴(야상곡)", "에튀드(연습곡)", "발라드", "환상곡", "즉흥곡", "전주곡", "협주곡",
+        "비르투오소", "독주(솔로)", "손 교차", "운지 번호", "엄지 넘기기"),
+    "유지: 페달(CC64)은 원본 그대로 두고 건드리지 않음": (
+        "서스테인 페달", "CC64(서스테인 페달 메시지)", "플러터 페달", "싱코페이티드 페달링", "댐퍼"),
+}
+_NO_EFFECT = {
+    **{k: "악보 표기 전용(piano.musicxml) — 음 보정과 무관" for k in ("MIDI", "큰보표", "높은음자리표", "낮은음자리표", "가온다", "덧줄", "옥타브 기호(8va/8vb)")},
+    "볼타": "작곡가 지시 — 음 보정 근거가 되지 않음", "다 카포(D.C.)": "작곡가 지시 — 음 보정 근거가 되지 않음", "달 세뇨(D.S.)": "작곡가 지시 — 음 보정 근거가 되지 않음",
+    "코다(Coda)": "작곡가 지시 — 음 보정 근거가 되지 않음", "피네(Fine)": "작곡가 지시 — 음 보정 근거가 되지 않음",
+    "소프트 페달(우나 코르다)": "CC67 정보 없음", "소스테누토 페달": "CC66 정보 없음", "하프 페달": "페달 중간값 정보 없음", "쿼터 페달": "페달 중간값 정보 없음",
+    "팔 무게 주법": "연주 동작 정보 — 음에 반영 불가", "릴랙세이션(이완)": "연주 동작 정보 — 음에 반영 불가",
+    "음색(Timbre)": "렌더 단계(SoundFont) 소관 — 음표 보정과 무관", "배음(Overtone)": "렌더·전사 모델 내부 — 보정에서 별도 조작 불가", "공명(Resonance)": "렌더 단계(홀 리버브) 소관",
+    "피아노 액션 구조": "악기 내부 구조 — 정보 없음", "해머": "악기 내부 구조 — 정보 없음", "이스케이프먼트": "악기 내부 구조 — 정보 없음", "더블 이스케이프먼트": "악기 내부 구조 — 정보 없음",
+    "향판(사운드보드)": "악기 내부 구조 — 정보 없음", "브릿지": "악기 내부 구조 — 정보 없음", "주철 프레임": "악기 내부 구조 — 정보 없음", "튜닝 핀": "악기 내부 구조 — 정보 없음",
+    "조율": "MIDI는 음높이 고정(A4=440Hz)", "평균율": "렌더·MIDI가 이미 12평균율", "순정률": "MIDI로 표현 불가", "피타고라스 음률": "MIDI로 표현 불가",
+    "인토네이션(해머 보이싱)": "정보 없음", "프리페어드 피아노": "음높이 MIDI로 구분 불가", "피아노 현 직접 주법(인사이드 피아노)": "음높이 MIDI로 구분 불가",
+    "피아노 피치카토": "음높이 MIDI로 구분 불가", "피아노 하모닉스": "음높이 MIDI로 구분 불가", "애프터터치": "모델 출력 없음", "피치벤드": "피아노 음높이는 고정",
+    "멀티 벨로시티 레이어 샘플링": "렌더 단계에서 사용(벨로시티가 샘플 레이어를 고름) — 보정된 벨로시티가 그대로 반영됨", "릴리즈 트리거": "렌더러 기능", "물리 모델링": "렌더는 샘플 기반",
+    "스테레오 마이킹(A/B·X/Y·ORTF)": "녹음 정보 — MP3에 없음", "피아노 리드 각도 조절": "녹음 정보 — 오디오에서 복원 불가", "위상 정합(Phase)": "정규화 단계에서 이미 점검",
+}
+KEYWORD_ROLE: dict[str, str] = {k: g for g, ks in _ROLE_GROUPS.items() for k in ks}
+KEYWORD_ROLE.update({k: "해당 없음: " + why for k, why in _NO_EFFECT.items()})
 
 
 def write_theory_midi(src: Path, dest: Path, notes: list) -> None:
@@ -2288,6 +2413,7 @@ class App:
                 info["f1_piano_mid"] = note_f1([TNote(n.onset_s, n.offset_s, n.pitch, n.velocity) for n in notes], refn)
                 info["f1_piano_theory_mid"] = note_f1(new, refn)
                 info["f1_note"] = "(정밀도, 재현율, F1) — 음높이 일치 + 시작 시각 ±50ms"
+            info["keyword_roles"] = {k: KEYWORD_ROLE.get(k, "미지정") for k in KEYWORD_LIST}
             (job.out / "theory_refine_report.json").write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
         except Exception:
             event_log("theory_refine_failed", job=job.id, traceback=traceback.format_exc())
